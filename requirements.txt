@@ -1,0 +1,5 @@
+numpy~=1.26
+pandas
+pygame
+pettingzoo
+gymnasium
