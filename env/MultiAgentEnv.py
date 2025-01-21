@@ -6,8 +6,8 @@ import numpy as np
 from gymnasium.spaces import Discrete, Dict, MultiDiscrete, MultiBinary, Box, Tuple
 from pettingzoo import ParallelEnv
 from gymnasium.utils import seeding
-from pettingzoo.utils import agent_selector, wrappers
-from pettingzoo.utils.env import AgentID, ObsType
+
+import pygame
 
 
 class UAVState(Enum):
@@ -18,13 +18,12 @@ class UAVState(Enum):
 
 class CustomerState(Enum):
     WAITING = 0
-    TRUCK_DELIVERED = 1
-    UAV_DELIVERED = 2
+    DELIVERED = 1
 
 
 class DeliveryEnv(ParallelEnv):
     metadata = {
-        "render.modes": ["human", "rgb_array"],
+        "render_modes": ["human", "rgb_array"],
         "name": "delivery_env_v1",
     }
 
@@ -50,6 +49,9 @@ class DeliveryEnv(ParallelEnv):
         # random number generator
         self.RNG, _ = seeding.np_random()
 
+        # visualization
+        self.screen = None
+
         # hyperparameters
         self.uav_num = config.get("uav_num", 2)
         self.truck_num = config.get("truck_num", 1)
@@ -61,8 +63,8 @@ class DeliveryEnv(ParallelEnv):
         self.max_step = config.get("max_step", 10_000)
         self.num_customer = config.get("num_customer", 20)
         self.render_mode = config.get("render_mode", "human")
-        self.space_width = config.get("space_width", 100)
-        self.space_height = config.get("space_height", 100)
+        self.space_width = config.get("space_width", 10)
+        self.space_height = config.get("space_height", 10)
 
         self.means = config.get("means", [0, 0])
         self.std_dev = config.get("std_devs", [1, 1])
@@ -143,7 +145,7 @@ class DeliveryEnv(ParallelEnv):
         self.agents = copy(self.possible_agents)
         self.time_step = 0
         self.nodes_location = self._generate_nodes()
-        self.nodes_weight = self._generate_nodes_weight()
+        self.nodes_weight = self._generate_parcel_weight()
         self.warehouse = (0, 0)
         self.cur_uav_capacity = {
             agent: self.uav_capacity for agent in self.possible_agents if agent.startswith("uav")
@@ -181,18 +183,33 @@ class DeliveryEnv(ParallelEnv):
     def step(self, action):
         pass
 
-    def render(self, mode='human'):
-        pass
+    def render(self):
+        if self.render_mode == "human":
+            pass
+        elif self.render_mode == "rgb_array":
+            pass
+        else:
+            raise ValueError(f"Unknown render mode: {self.render_mode}")
+
+    def close(self):
+        if self.screen is not None:
+            pygame.quit()
+            self.screen = None
 
     def _generate_nodes(self):
         """generate the nodes in the space
         :return: the coordinates of the nodes
         """
-        x_coordinates = np.clip(self.RNG.normal(self.means[0], self.std_dev[0], self.num_customer), -self.space_width, self.space_width)
-        y_coordinates = np.clip(self.RNG.normal(self.means[1], self.std_dev[1], self.num_customer), -self.space_height, self.space_height)
-        return np.stack((x_coordinates, y_coordinates), axis=1)
+        coordinates = set()
+        while len(coordinates) < self.num_customer:
+            # normal distribution round to integer
+            batch = self.RNG.normal(self.means, self.std_dev, size=(self.num_customer - len(coordinates), 2)).astype(int)
+            batch_filtered = batch[(-self.space_width <= batch[:, 0] <= self.space_width) & (batch[:] != self.warehouse)
+                                   & (-self.space_height <= batch[:, 1] <= self.space_height)]
+            coordinates.update(tuple(row) for row in batch_filtered)
+        return np.array(list(coordinates))
 
-    def _generate_nodes_weight(self):
+    def _generate_parcel_weight(self):
         """generate the weights of the nodes
         :return: the weights of the nodes
         """
