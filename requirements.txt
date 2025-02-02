@@ -1,5 +1,6 @@
 numpy~=1.26
 pandas
-pygame
-pettingzoo
-gymnasium
+pygame~=2.6.1
+pettingzoo~=1.24.3
+gymnasium~=1.0.0
+scikit-learn~=1.0.2
