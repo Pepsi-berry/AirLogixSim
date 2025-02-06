@@ -1,3 +1,4 @@
+# TODO: uav can only serve customers in the current cluster
 import functools
 from copy import copy
 from enum import Enum
@@ -258,7 +259,7 @@ class DeliveryEnv(ParallelEnv):
                 if self.node_mask[act] != PackageState.WAITING.value:  # the node has been assigned or delivered
                     rewards[agent] += -1
                     continue
-                elif self.agent_coordinates[agent] == self.nodes_location[act]:  # the agent is at the target
+                elif np.array_equal(np.array(self.agent_coordinates[agent]), self.nodes_location[act]):
                     rewards[agent] += -1
                     continue
                 self.node_mask[act] = PackageState.ASSIGNED.value
@@ -268,20 +269,20 @@ class DeliveryEnv(ParallelEnv):
                         agent] * self.power_coefficient
                     self.cur_uav_capacity[agent] -= self.nodes_weight[act]
                     group_num, _ = self._get_agent_group(agent)
-                    self.truck_loaded_uav[f"truck_{group_num}_0"].remove(agent)  # unregister uav
+                    self.truck_loaded_uav[f"truck_{group_num}_0"].discard(agent)  # unregister uav
                     self.agent_status[agent] = UAVState.DELIVERING.value
                 else:
                     self.agent_status[agent] = TruckState.MOVING.value
                     self.group_assigned[group_num] = self._get_k_means_cluster(self.agent_coordinates[agent])
             elif agent.startswith("truck") and act == self.num_customer:
-                if self.agent_coordinates[agent] == self.warehouse:
+                if np.array_equal(np.array(self.agent_coordinates[agent]), self.warehouse):
                     rewards[agent] += -1
                     continue
                 self.agent_target[agent] = "warehouse"
                 self.group_assigned[group_num] = None
             elif agent.startswith("uav") and act < self.num_customer + self.truck_num:
                 group_num, _ = self._get_agent_group(agent)
-                if self.agent_coordinates[agent] == self.agent_coordinates[f"truck_{group_num}_0"]:
+                if np.array_equal(np.array(self.agent_coordinates[agent]), self.agent_coordinates[f"truck_{group_num}_0"]):
                     rewards[agent] += -1
                     continue
                 self.agent_target[agent] = f"truck_{group_num}_{act - self.num_customer}"
@@ -478,9 +479,14 @@ class DeliveryEnv(ParallelEnv):
         group_num, agent_num = self._get_agent_group(agent)
 
         if agent.startswith("truck"):
-            return status == TruckState.LANDING.value and all(
-                self.agent_status[f"uav_{group_num}_{i}"] in (UAVState.IDLE.value, UAVState.INIT.value) for i in
-                range(self.uav_num))
+            if self.group_assigned[group_num] is None:
+                return status == TruckState.LANDING.value and all(
+                    self.agent_status[f"uav_{group_num}_{i}"] in (UAVState.IDLE.value, UAVState.INIT.value) for i in
+                    range(self.uav_num))
+            else:
+                return (status == TruckState.LANDING.value and all(
+                    self.agent_status[f"uav_{group_num}_{i}"] in (UAVState.IDLE.value, UAVState.INIT.value) for i in range(self.uav_num))
+                        and self._is_cluster_delivered(self.group_assigned[group_num]))
         else:
             return (status == UAVState.IDLE.value or status == UAVState.LANDING.value) and all(
                 self.agent_status[f"truck_{group_num}_{i}"] == TruckState.LANDING.value for i in range(self.truck_num))
