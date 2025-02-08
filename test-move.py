@@ -5,6 +5,7 @@ from env.MultiAgentEnv import DeliveryEnv, PackageState
 frame_rate = 1
 env = DeliveryEnv({"uav_num": 10, "uav_velocity": 3/frame_rate, "truck_velocity": 1/frame_rate})
 observation, info = env.reset()
+env.render()
 
 print(observation)
 print("==" * 20)
@@ -14,7 +15,6 @@ print(info)
 running = True
 index = 1
 while running:
-    env.render()
     action = {}
     if observation['truck_0_0']['action_mask'] == 1 and observation['truck_0_0']['node_mask'][0] == PackageState.WAITING.value:
         action['truck_0_0'] = 0
@@ -30,13 +30,14 @@ while running:
     running = not truncation and any([not t for t in termination.values()])
     print(termination)
 
+    env.render()
     time.sleep(1/frame_rate)
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
+print("==" * 20)
 print(observation)
 print("==" * 20)
-print(info)
 input()
 
 env.close()
