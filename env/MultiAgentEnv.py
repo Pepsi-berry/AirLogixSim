@@ -273,7 +273,7 @@ class DeliveryEnv(ParallelEnv):
                     self.agent_status[agent] = UAVState.DELIVERING.value
                 else:
                     self.agent_status[agent] = TruckState.MOVING.value
-                    self.group_assigned[group_num] = self._get_k_means_cluster(self.agent_coordinates[agent])
+                    self.group_assigned[group_num] = self._get_k_means_cluster(self.nodes_location[act])
             elif agent.startswith("truck") and act == self.num_customer:
                 if np.array_equal(np.array(self.agent_coordinates[agent]), self.warehouse):
                     rewards[agent] += -1
@@ -352,18 +352,23 @@ class DeliveryEnv(ParallelEnv):
                     self.cur_uav_power[agent] -= (cur_uav_load + self.uav_weight) * self.uav_velocity * self.power_coefficient
             else:
                 group_num, _ = self._get_agent_group(agent)
-                for x in range(self.truck_velocity):
-                    if agent_coordinate[0] != target_coordinate[0]:
+                available_step = self.truck_velocity
+                while available_step > 10e-14:
+                    if abs(self.agent_coordinates[agent][0] - target_coordinate[0]) > 10e-14:
+                        length = min(available_step, abs(x_distance))
                         direction = 1 if x_distance > 0 else -1
-                        self.agent_coordinates[agent] = (agent_coordinate[0] + direction, agent_coordinate[1])
+                        self.agent_coordinates[agent] = (self.agent_coordinates[agent][0] + direction * length, self.agent_coordinates[agent][1])
+                        available_step -= length
                         for uav in self.truck_loaded_uav[agent]:
                             self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                    elif agent_coordinate[1] != target_coordinate[1]:
+                    elif abs(self.agent_coordinates[agent][1] - target_coordinate[1]) > 10e-14:
+                        length = min(available_step, abs(y_distance))
                         direction = 1 if y_distance > 0 else -1
-                        self.agent_coordinates[agent] = (agent_coordinate[0], agent_coordinate[1] + direction)
+                        self.agent_coordinates[agent] = (self.agent_coordinates[agent][0], self.agent_coordinates[agent][1] + direction * length)
+                        available_step -= length
                         for uav in self.truck_loaded_uav[agent]:
                             self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                    else:  # target is reached
+                    else:
                         self.agent_status[agent] = TruckState.LANDING.value
                         self.agent_target[agent] = None
                         if target != 'warehouse':
@@ -382,10 +387,42 @@ class DeliveryEnv(ParallelEnv):
                                 rewards[agent] += -10
                         break
 
+                # for x in range(self.truck_velocity):
+                #     if agent_coordinate[0] != target_coordinate[0]:
+                #         direction = 1 if x_distance > 0 else -1
+                #         self.agent_coordinates[agent] = (agent_coordinate[0] + direction, agent_coordinate[1])
+                #         for uav in self.truck_loaded_uav[agent]:
+                #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
+                #     elif agent_coordinate[1] != target_coordinate[1]:
+                #         direction = 1 if y_distance > 0 else -1
+                #         self.agent_coordinates[agent] = (agent_coordinate[0], agent_coordinate[1] + direction)
+                #         for uav in self.truck_loaded_uav[agent]:
+                #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
+                #     else:  # target is reached
+                #         self.agent_status[agent] = TruckState.LANDING.value
+                #         self.agent_target[agent] = None
+                #         if target != 'warehouse':
+                #             self.node_mask[target] = PackageState.DELIVERED.value
+                #             for uav in self.truck_loaded_uav[agent]:
+                #                 self.terminations[uav] = False  # open for delivery
+                #                 self.agent_status[uav] = UAVState.IDLE.value
+                #             rewards[agent] += 1
+                #         else:
+                #             self.agent_status[agent] = TruckState.LANDING.value
+                #             if np.all(self.node_mask == PackageState.DELIVERED.value):
+                #                 for every_agent in self.possible_agents:
+                #                     rewards[every_agent] += 100
+                #                 self.terminations[agent] = True
+                #             else:
+                #                 rewards[agent] += -10
+                #         break
+
         # Only when all clusters are delivered, all uavs return to the truck and truck is at warehouse, the truck can move.
         for agent in self.possible_agents:
             group_num, _ = self._get_agent_group(agent)
-            if agent.startswith("uav") and self.group_assigned[group_num] is None:
+            if agent.startswith("uav") and self.group_assigned[group_num] is None and all(x == PackageState.DELIVERED.value for x in self.node_mask):
+                self.terminations[agent] = True
+            elif agent.startswith("uav") and self.group_assigned[group_num] is None:
                 self.terminations[agent] = False
             elif agent.startswith("uav"):
                 self.terminations[agent] = self._is_cluster_delivered(self.group_assigned[group_num]) and self._get_action_mask(agent)
@@ -595,8 +632,6 @@ class DeliveryEnv(ParallelEnv):
             material_path = os.path.join(cur_dir, "img", material)
             img = pygame.image.load(material_path)
             self.material_library[material_key] = pygame.transform.scale(img, (self.element_size, self.element_size))
-
-        print(self.material_library)
 
     def _draw_grid(self):
         for x in range(0, self.screen_width, self.element_size):
