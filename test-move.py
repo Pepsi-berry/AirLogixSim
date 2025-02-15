@@ -3,7 +3,7 @@ import time
 from env.MultiAgentEnv import DeliveryEnv, PackageState
 
 frame_rate = 1
-env = DeliveryEnv({"uav_num": 10, "uav_velocity": 3/frame_rate, "truck_velocity": 1/frame_rate})
+env = DeliveryEnv({"uav_num": 2, "uav_velocity": 5/frame_rate, "truck_velocity": 2/frame_rate})
 observation, info = env.reset()
 env.render()
 
@@ -28,13 +28,19 @@ while running:
     observation, reward, termination, truncation, info = env.step(action)
 
     running = not truncation and any([not t for t in termination.values()])
-    print(termination)
+    # print(termination)
+
+    print(info['cur_time_step'])
+    print(observation)
+    print(action)
+    print(reward)
+    print("==" * 20)
 
     env.render()
     time.sleep(1/frame_rate)
-    for event in pygame.event.get():
-        if event.type == pygame.QUIT:
-            running = False
+    # for event in pygame.event.get():
+    #     if event.type == pygame.QUIT:
+    #         running = False
 print("==" * 20)
 print(observation)
 print("==" * 20)
