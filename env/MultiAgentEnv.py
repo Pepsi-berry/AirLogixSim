@@ -1,4 +1,3 @@
-# TODO: uav can only serve customers in the current cluster
 import functools
 from copy import copy
 from enum import Enum
@@ -114,6 +113,22 @@ class DeliveryEnv(ParallelEnv):
 
         self.means = config.get("means", [0, 0])
         self.std_dev = config.get("std_devs", [1, 1])
+
+        self.reward_dict = {
+            "every_time_step": -1,
+            "uav_out_of_power": -100,
+            "uav_out_of_capacity": -100,
+            "uav_out_of_cluster": -1,
+            "uav_out_of_power_return": -10,
+            "uav_closed_nodes": -10,
+            "uav_current_target": -1,
+            "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10+distance*0.1-(self.uav_capacity-load)*0.5,
+            "uav_charging": lambda power: 5 if power < self.low_power_threshold else -5,
+            "mission_completed": 100,
+            "truck_current_target": -1,
+            "truck_serve_customer": 1,
+            "truck_illegal_return": -10
+        }
 
         # agent definition
         self.possible_agents = ([f"uav_{i}_{j}" for j in range(self.uav_num) for i in range(self.group_num)]
@@ -257,7 +272,7 @@ class DeliveryEnv(ParallelEnv):
             terminations = {agent: True for agent in self.possible_agents}
             return observations, rewards, terminations, self.truncation, self.infos
 
-        rewards = {agent: -1 for agent in self.possible_agents}
+        rewards = {agent: self.reward_dict["every_time_step"] for agent in self.possible_agents}
         observations = self._get_observations()
 
         # update agent targets
@@ -268,18 +283,27 @@ class DeliveryEnv(ParallelEnv):
                 continue
             elif act < self.num_customer:  # customer
                 if self.node_mask[act] != PackageState.WAITING.value:  # the node has been assigned or delivered
-                    rewards[agent] += -1
+                    rewards[agent] += self.reward_dict["uav_closed_nodes"]
                     continue
                 elif np.array_equal(np.array(self.agent_coordinates[agent]), self.nodes_location[act]):
-                    rewards[agent] += -1
+                    rewards[agent] += self.reward_dict["uav_current_target"]
                     continue
                 self.node_mask[act] = PackageState.ASSIGNED.value
                 self.agent_target[agent] = act
                 if agent.startswith("uav"):  # if uav decides to deliver a new parcel, update the power and capacity
                     if all(x != UAVChoice.FEASIBLE.value for x in observations[agent]["choice_mask"]):
                         pass  # dead
-                    elif observations[agent]["choice_mask"][act] != UAVChoice.FEASIBLE.value:
-                        rewards[agent] += -10
+                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_CAPACITY.value:
+                        rewards[agent] += self.reward_dict["uav_out_of_capacity"]
+                        continue
+                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_POWER.value:
+                        rewards[agent] += self.reward_dict["uav_out_of_power"]
+                        continue
+                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_CLUSTER.value:
+                        rewards[agent] += self.reward_dict["uav_out_of_cluster"]
+                        continue
+                    elif observations[agent]["choice_mask"][act] == UAVChoice.CANNOT_RETURN.value:
+                        rewards[agent] += self.reward_dict["uav_out_of_power_return"]
                         continue
                     self.cur_uav_power[agent] -= self._calc_power_consumption(self.nodes_weight[act],
                                                                               self.cur_uav_travel_distance[agent])
@@ -300,8 +324,9 @@ class DeliveryEnv(ParallelEnv):
                 group_num, _ = self._get_agent_group(agent)
                 if np.array_equal(np.array(self.agent_coordinates[agent]),
                                   self.agent_coordinates[f"truck_{group_num}_0"]):
-                    rewards[agent] += -1
+                    rewards[agent] += self.reward_dict["truck_current_target"]
                     continue
+                self.agent_status[agent] = UAVState.RETURNING.value
                 self.agent_target[agent] = f"truck_{group_num}_{act - self.num_customer}"
             else:
                 raise ValueError(f"Unknown action: {act}, agent: {agent}")
@@ -327,7 +352,7 @@ class DeliveryEnv(ParallelEnv):
 
             if agent.startswith("uav"):
                 if self.cur_uav_capacity[agent] < 0 or self.cur_uav_power[agent] <= 0:  # dead
-                    rewards[agent] += -100
+                    rewards[agent] += self.reward_dict["uav_out_of_power"]
                     if target < self.num_customer:
                         self.node_mask[target] = PackageState.WAITING.value
                     self.cur_uav_capacity[agent] = self.uav_capacity
@@ -342,10 +367,8 @@ class DeliveryEnv(ParallelEnv):
                     group_num, _ = self._get_agent_group(agent)
                     self.truck_loaded_uav[f"truck_{group_num}_0"].add(agent)  # register uav
                     self.agent_coordinates[agent] = target_coordinate
-                    rewards[agent] += 0 if self.cur_uav_travel_distance[agent] == 0 else (
-                            10 + self.cur_uav_travel_distance[agent] * 0.1 + (
-                            self.uav_capacity - self.cur_uav_capacity[agent]) * 0.5)  # finish delivery
-                    rewards[agent] += 5 * (1 if self.cur_uav_power[agent] < self.low_power_threshold else -1)
+                    rewards[agent] += self.reward_dict["uav_round_trip"](self.cur_uav_travel_distance[agent], self.cur_uav_capacity[agent])
+                    rewards[agent] += self.reward_dict["uav_charging"](self.cur_uav_power[agent])
                     self.cur_uav_travel_distance[agent] = 0
                     self.cur_uav_power[agent] = self.uav_power
                     self.cur_uav_capacity[agent] = self.uav_capacity
@@ -399,15 +422,15 @@ class DeliveryEnv(ParallelEnv):
                             for uav in self.truck_loaded_uav[agent]:
                                 self.terminations[uav] = False  # open for delivery
                                 self.agent_status[uav] = UAVState.IDLE.value
-                            rewards[agent] += 1
+                            rewards[agent] += self.reward_dict["truck_serve_customer"]
                         else:
                             self.agent_status[agent] = TruckState.LANDING.value
                             if np.all(self.node_mask == PackageState.DELIVERED.value):
                                 for every_agent in self.possible_agents:
-                                    rewards[every_agent] += 100
+                                    rewards[every_agent] += self.reward_dict["mission_completed"]
                                 self.terminations[agent] = True
                             else:
-                                rewards[agent] += -10
+                                rewards[agent] += self.reward_dict["truck_illegal_return"]
                         break
 
                 # for x in range(self.truck_velocity):
@@ -529,7 +552,7 @@ class DeliveryEnv(ParallelEnv):
                     if x < self.num_customer:
                         if self.node_mask[x] != PackageState.WAITING.value:
                             obs["choice_mask"][x] = UAVChoice.CLOSED_NODE.value
-                        elif self.group_assigned[group_num] is not None and self._get_k_means_cluster(
+                        elif self.group_assigned[group_num] is None or self.group_assigned[group_num] is not None and self._get_k_means_cluster(
                                 self.nodes_location[x]) != self.group_assigned[group_num]:
                             obs["choice_mask"][x] = UAVChoice.OUT_OF_CLUSTER.value
                         elif (self.cur_uav_power[agent] - self._calc_power_consumption(
@@ -636,6 +659,29 @@ class DeliveryEnv(ParallelEnv):
             elements.append(np.array(cluster_elements))
         self.infos["cluster_elements"] = copy(elements)
         self.infos["cluster_centers"] = copy(self.kmeans.cluster_centers_)
+
+        mask = {}
+        for index, x in enumerate(self.kmeans.labels_):
+            if x not in mask:
+                mask[x] = []
+            mask[x].append(index)
+        self.infos["cluster_mask"] = copy(mask)
+
+        center_node = {}
+        for x in range(self.kmeans.n_clusters):
+            kmeans_center = self.kmeans.cluster_centers_[x]
+            # center_node[x] = self.nodes_location[np.argmin(np.linalg.norm(self.nodes_location - kmeans_center, axis=1))]
+            # calc the index of the customer node which is closest to the center of the cluster
+            min_distance = float("inf")
+            min_index = None
+            for index, node in enumerate(self.nodes_location):
+                distance = self._calc_distance(kmeans_center, node)
+                if distance < min_distance:
+                    min_distance = distance
+                    min_index = index
+            center_node[x] = min_index
+
+        self.infos["center_node"] = copy(center_node)
 
         # TODO: decide how to decide a node for trucks
 
