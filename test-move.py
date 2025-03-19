@@ -1,16 +1,16 @@
 import pygame
 import time
-from env.MultiAgentEnv import DeliveryEnv, PackageState, UAVChoice
+from env.MultiAgentEnv import DeliveryEnv, PackageState, UAVActionRet
 
 frame_rate = 24
-env = DeliveryEnv({"uav_num": 2, "uav_velocity": 5/frame_rate, "truck_velocity": 2/frame_rate, "uav_power": 20, "power_coefficient": 0.4})
+env = DeliveryEnv({"uav_num": 2, "uav_velocity": 5/frame_rate, "truck_velocity": 2/frame_rate, "uav_power": 20, "power_coefficient": 0.2})
 observation, info = env.reset()
 env.render()
 
 # print(env.kmeans.labels_)
-# print(observation)
+print(observation)
 # print("==" * 20)
-# print(info)
+print(info)
 # exit(0)
 
 input()
@@ -43,9 +43,10 @@ while running:
             continue
         else:
             for index, i in enumerate(observation[f'uav_0_{x}']['choice_mask']):
-                if i == UAVChoice.FEASIBLE.value and (all(act != index for act in action.values()) or index == env.num_customer):
+                if i == UAVActionRet.FEASIBLE.value and (all(act != index for act in action.values()) or index == env.num_customer):
                     action[f'uav_0_{x}'] = index
                     break
+            print(observation[f"uav_0_{x}"]['choice_mask'])
             # action[f'uav_0_{x}'] = 0
     observation, reward, termination, truncation, info = env.step(action)
 

@@ -32,13 +32,14 @@ class PackageState(Enum):
     DELIVERED = 2
 
 
-class UAVChoice(Enum):
+class UAVActionRet(Enum):
     FEASIBLE = 0  # uav can move
     OUT_OF_CLUSTER = 1  # node is out of current k-means cluster
     OUT_OF_POWER = 2  # uav will be out of power if it moves
     OUT_OF_CAPACITY = 3  # uav will be out of capacity if it moves
     CLOSED_NODE = 4  # node has been assigned or delivered
     CANNOT_RETURN = 5  # uav cannot return to the truck if it moves
+    STAY_AT_TRUCK = 6  # uav choose truck repeatedly
 
 
 class ColorFamily:
@@ -86,7 +87,7 @@ class DeliveryEnv(ParallelEnv):
 
         # visualization
         self.screen = None
-        self.element_size = 25
+        self.element_size = 15
         self.screen_width = None
         self.screen_height = None
         self.material_library = {}
@@ -143,7 +144,7 @@ class DeliveryEnv(ParallelEnv):
         self.nodes_location = None
         self.nodes_weight = None
         self.node_mask = np.zeros(self.num_customer)
-        self.warehouse = (0, 0)
+        self.warehouse = [0, 0]
         self.cur_uav_capacity = None
         self.cur_uav_power = None
         self.cur_uav_travel_distance = None
@@ -189,7 +190,7 @@ class DeliveryEnv(ParallelEnv):
                                              dtype=np.float32
                                          )
                                      ] * self.truck_num)
-                obs["choice_mask"] = MultiDiscrete([len(UAVChoice)] * (self.num_customer + self.truck_num))
+                obs["choice_mask"] = MultiDiscrete([len(UAVActionRet)] * (self.num_customer + self.truck_num))
                 obs["power"] = Box(0, high=self.uav_power, dtype=np.float32)
                 obs["capacity"] = Box(0, high=self.uav_capacity, dtype=np.float32)
                 obs["travel_distance"] = Box(0, high=self.space_width * self.space_height, dtype=np.float32)
@@ -225,7 +226,7 @@ class DeliveryEnv(ParallelEnv):
         self.nodes_weight = self._generate_parcel_weight()
         self.node_mask = np.array([PackageState.WAITING.value] * self.num_customer)
         # self.node_mask = np.zeros(self.num_customer)
-        self.warehouse = (0, 0)
+        self.warehouse = [0, 0]
         self.cur_uav_capacity = {
             agent: self.uav_capacity for agent in self.possible_agents if agent.startswith("uav")
         }
@@ -291,18 +292,18 @@ class DeliveryEnv(ParallelEnv):
                 self.node_mask[act] = PackageState.ASSIGNED.value
                 self.agent_target[agent] = act
                 if agent.startswith("uav"):  # if uav decides to deliver a new parcel, update the power and capacity
-                    if all(x != UAVChoice.FEASIBLE.value for x in observations[agent]["choice_mask"]):
+                    if all(x != UAVActionRet.FEASIBLE.value for x in observations[agent]["choice_mask"]):
                         pass  # dead
-                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_CAPACITY.value:
+                    elif observations[agent]["choice_mask"][act] == UAVActionRet.OUT_OF_CAPACITY.value:
                         rewards[agent] += self.reward_dict["uav_out_of_capacity"]
                         continue
-                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_POWER.value:
+                    elif observations[agent]["choice_mask"][act] == UAVActionRet.OUT_OF_POWER.value:
                         rewards[agent] += self.reward_dict["uav_out_of_power"]
                         continue
-                    elif observations[agent]["choice_mask"][act] == UAVChoice.OUT_OF_CLUSTER.value:
+                    elif observations[agent]["choice_mask"][act] == UAVActionRet.OUT_OF_CLUSTER.value:
                         rewards[agent] += self.reward_dict["uav_out_of_cluster"]
                         continue
-                    elif observations[agent]["choice_mask"][act] == UAVChoice.CANNOT_RETURN.value:
+                    elif observations[agent]["choice_mask"][act] == UAVActionRet.CANNOT_RETURN.value:
                         rewards[agent] += self.reward_dict["uav_out_of_power_return"]
                         continue
                     self.cur_uav_power[agent] -= self._calc_power_consumption(self.nodes_weight[act],
@@ -318,9 +319,11 @@ class DeliveryEnv(ParallelEnv):
                 if np.array_equal(np.array(self.agent_coordinates[agent]), self.warehouse):
                     rewards[agent] += -1
                     continue
+                self.agent_status[agent] = TruckState.MOVING.value
                 self.agent_target[agent] = "warehouse"
                 self.group_assigned[group_num] = None
             elif agent.startswith("uav") and act < self.num_customer + self.truck_num:
+                # try to return to truck
                 group_num, _ = self._get_agent_group(agent)
                 if np.array_equal(np.array(self.agent_coordinates[agent]),
                                   self.agent_coordinates[f"truck_{group_num}_0"]):
@@ -353,7 +356,7 @@ class DeliveryEnv(ParallelEnv):
             if agent.startswith("uav"):
                 if self.cur_uav_capacity[agent] < 0 or self.cur_uav_power[agent] <= 0:  # dead
                     rewards[agent] += self.reward_dict["uav_out_of_power"]
-                    if target < self.num_customer:
+                    if type(target) is int and target < self.num_customer:
                         self.node_mask[target] = PackageState.WAITING.value
                     self.cur_uav_capacity[agent] = self.uav_capacity
                     self.cur_uav_power[agent] = self.uav_power
@@ -472,8 +475,10 @@ class DeliveryEnv(ParallelEnv):
             elif agent.startswith("uav") and self.group_assigned[group_num] is None:
                 self.terminations[agent] = False
             elif agent.startswith("uav"):
+                # self.terminations[agent] = self._is_cluster_delivered(
+                #     self.group_assigned[group_num]) and self._get_action_mask(agent)
                 self.terminations[agent] = self._is_cluster_delivered(
-                    self.group_assigned[group_num]) and self._get_action_mask(agent)
+                    self.group_assigned[group_num]) and self.agent_status[agent] == UAVState.IDLE.value
             else:  # truck
                 self.terminations[agent] = (self._get_action_mask(agent)
                                             and np.array_equal(np.array(self.agent_coordinates[agent]),
@@ -551,18 +556,18 @@ class DeliveryEnv(ParallelEnv):
                 for x in range(self.num_customer + self.truck_num):
                     if x < self.num_customer:
                         if self.node_mask[x] != PackageState.WAITING.value:
-                            obs["choice_mask"][x] = UAVChoice.CLOSED_NODE.value
+                            obs["choice_mask"][x] = UAVActionRet.CLOSED_NODE.value
                         elif self.group_assigned[group_num] is None or self.group_assigned[group_num] is not None and self._get_k_means_cluster(
                                 self.nodes_location[x]) != self.group_assigned[group_num]:
-                            obs["choice_mask"][x] = UAVChoice.OUT_OF_CLUSTER.value
+                            obs["choice_mask"][x] = UAVActionRet.OUT_OF_CLUSTER.value
                         elif (self.cur_uav_power[agent] - self._calc_power_consumption(
                                 (self.nodes_weight[x] + self.uav_weight), (self.cur_uav_travel_distance[agent] +
                                                                            self._calc_distance(
                                                                                self.agent_coordinates[agent],
                                                                                self.nodes_location[x]))) <= 0):
-                            obs["choice_mask"][x] = UAVChoice.OUT_OF_POWER.value
+                            obs["choice_mask"][x] = UAVActionRet.OUT_OF_POWER.value
                         elif self.cur_uav_capacity[agent] - self.nodes_weight[x] < 0:
-                            obs["choice_mask"][x] = UAVChoice.OUT_OF_CAPACITY.value
+                            obs["choice_mask"][x] = UAVActionRet.OUT_OF_CAPACITY.value
                         else:
                             delivery_power = self._calc_power_consumption((self.nodes_weight[x] + self.uav_weight),
                                                                           (self.cur_uav_travel_distance[
@@ -572,16 +577,19 @@ class DeliveryEnv(ParallelEnv):
                             return_power = self._calc_power_consumption(self.uav_weight, self._calc_distance(
                                 self.nodes_location[x], self.agent_coordinates[f"truck_{group_num}_0"]))
                             if self.cur_uav_power[agent] - delivery_power - return_power <= 0:
-                                obs["choice_mask"][x] = UAVChoice.OUT_OF_POWER.value
+                                obs["choice_mask"][x] = UAVActionRet.OUT_OF_POWER.value
                             else:
-                                obs["choice_mask"][x] = UAVChoice.FEASIBLE.value
+                                obs["choice_mask"][x] = UAVActionRet.FEASIBLE.value
                     else:
-                        return_power = self._calc_power_consumption(self.uav_weight, self._calc_distance(
-                            self.agent_coordinates[agent], self.agent_coordinates[f"truck_{group_num}_0"]))
-                        if self.cur_uav_power[agent] - return_power <= 0:
-                            obs["choice_mask"][x] = UAVChoice.OUT_OF_POWER.value
+                        if np.array_equal(np.array(self.agent_coordinates[agent]), self.agent_coordinates[f"truck_{group_num}_{x-self.num_customer}"]):
+                            obs["choice_mask"][x] = UAVActionRet.STAY_AT_TRUCK.value
                         else:
-                            obs["choice_mask"][x] = UAVChoice.FEASIBLE.value
+                            return_power = self._calc_power_consumption(self.uav_weight, self._calc_distance(
+                                self.agent_coordinates[agent], self.agent_coordinates[f"truck_{group_num}_0"]))
+                            if self.cur_uav_power[agent] - return_power <= 0:
+                                obs["choice_mask"][x] = UAVActionRet.OUT_OF_POWER.value
+                            else:
+                                obs["choice_mask"][x] = UAVActionRet.FEASIBLE.value
                 observations[agent] = obs
         return observations
 
@@ -645,7 +653,7 @@ class DeliveryEnv(ParallelEnv):
         """generate the weights of the nodes
         :return: the weights of the nodes
         """
-        return self.RNG.integers(1, self.uav_capacity // 2, self.num_customer)
+        return self.RNG.integers(self.uav_capacity // 4, self.uav_capacity // 2, self.num_customer)
 
     def _k_means_cluster(self):
         """k-means cluster the nodes
