@@ -1,5 +1,4 @@
 import math
-import time
 
 import torch
 import torch.nn as nn
@@ -7,13 +6,12 @@ import torch.optim as optim
 import torch.nn.functional as F
 import numpy as np
 from torch.distributions import Categorical
-from torch.nn.modules.module import T
-from tqdm import tqdm
 import datetime
 import matplotlib.pyplot as plt
 
 from env.MultiAgentEnv import DeliveryEnv, UAVActionRet
 from agent.truck import plan_truck_route
+from tqdm import tqdm
 
 # Set device
 device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
@@ -67,7 +65,7 @@ class UAVCritics(nn.Module):
     def forward(self, obs):
         """
         Args:
-            query: Tensor of shape (batch, candidate_embed_dim) with the query vector.
+            obs: Dictionary of observation tensors.
         Returns:
             value: Tensor of shape (batch, 1) with the state value estimate.
         """
@@ -215,7 +213,7 @@ class UAVActor(nn.Module):
         return probs
 
 
-def train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1000):
+def old_train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1000):
     """
     score = actor(obs)  # (batch, num_candidates)
     value = critic(obs)  # (batch, num_candidates)
@@ -232,29 +230,27 @@ def train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1
     uav_ids = [agent for agent in env.possible_agents if agent.startswith("uav")]
     actor = UAVActor().to(device)
     critic = LSTMCritic().to(device)
-    optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
-    optimizer_critic = optim.AdamW(critic.parameters(), lr=lr_critic)
+    optimizer_actor = optim.Adam(actor.parameters(), lr=lr_actor)
+    optimizer_critic = optim.Adam(critic.parameters(), lr=lr_critic)
     stats = {'Actor Loss': [], 'Critic Loss': [], 'Returns': [], 'Time cost': []}
 
     for episode in range(1, num_episodes + 1):
-        obs, info = env.reset(seed=None, options={'redistribute': True})
+        obs, info = env.reset(seed=None, options={'redistribute': False})
         done = False
         episode_return = 0
-        step_count = 0
         env_termination = {agent: False for agent in env.possible_agents}
 
         truck_route = plan_truck_route(obs["truck_0_0"]["nodes"].tolist(), list(info['center_node'].values()),
                                        env.warehouse)
         truck_route[1].append(env.num_customer)
-
+        print("==" * 50)
         while not all(env_termination.values()):
-            step_count += 1
             if obs['truck_0_0']['action_mask'] == 1:
                 try:
                     action_dict = {f'truck_0_0': truck_route[1].pop(0)}
                 except IndexError as e:
                     break
-                next_obs, rewards, terminations, truncation, info = env.step(action_dict)
+                next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
                 # cur_reward = sum(rewards[agent] for agent in uav_ids)
                 # done = all(terminations.values())
                 #
@@ -271,15 +267,8 @@ def train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1
                 env_termination = terminations
                 obs = next_obs
             elif all(obs[agent]['action_mask'] == 1 for agent in uav_ids):
-                cur_reward = 0
                 while not all(done if agent.startswith("uav") else True for agent, done in env_termination.items()):
                     if obs['uav_0_0']['action_mask'] != 1:
-                        action_dict = {}
-                        next_obs, rewards, terminations, truncation, info = env.step(action_dict)
-                        cur_reward += sum(rewards[agent] for agent in uav_ids)
-                        episode_return += sum(rewards[agent] for agent in uav_ids)
-                        env_termination = terminations
-                        obs = next_obs
                         continue
 
                     score = actor(obs)
@@ -291,14 +280,14 @@ def train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1
                     for i, agent in enumerate(uav_ids):
                         if obs[agent]['action_mask'] == 1:
                             action_dict[agent] = int(action[i].item())
-                    next_obs, rewards, terminations, truncation, info = env.step(action_dict)
-                    cur_reward += sum(rewards[agent] for agent in uav_ids)
+                    next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
+                    reward = rewards['uav_0_0']
                     done = all(done if agent.startswith("uav") else True for agent, done in env_termination.items())
 
                     value = critic(obs)
                     next_value = critic(next_obs)
 
-                    td_target = cur_reward + gamma * next_value * (1 - done)
+                    td_target = reward + gamma * next_value * (1 - done)
                     advantage = td_target - value
 
                     critic_loss = F.mse_loss(value, td_target.detach())
@@ -331,7 +320,106 @@ def train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1
             # env.render()
 
         stats['Returns'].append(episode_return)
-        stats['Time cost'].append(step_count)
+        stats['Time cost'].append(info['cur_time_step'])
+        # print(f"Episode {episode + 1}/{num_episodes} | Return: {episode_return}")
+
+    torch.save(actor.state_dict(), f"uav_actor_{datetime.datetime.now()}.pth")
+    torch.save(critic.state_dict(), f"uav_critic_{datetime.datetime.now()}.pth")
+
+    # draw episode-return graph and save
+    plt.plot(stats['Returns'])
+    plt.xlabel('Episode')
+    plt.ylabel('Return')
+    plt.title('Episode-Return Graph')
+    plt.savefig(f'episode_return_graph_{datetime.datetime.now()}.png')
+
+    # draw episode-timecost graph and save
+    plt.figure()
+    plt.plot(stats['Time cost'])
+    plt.xlabel('Episode')
+    plt.ylabel('Time cost')
+    plt.title('Episode-Time Cost Graph')
+    plt.savefig(f'episode_timecost_graph_{datetime.datetime.now()}.png')
+
+    env.close()
+
+
+def train(config=None, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3, num_episodes=1000):
+    """
+    score = actor(obs)  # (batch, num_candidates)
+    value = critic(obs)  # (batch, num_candidates)
+    :param config:
+    :param gamma:
+    :param lr_actor:
+    :param lr_critic:
+    :param num_episodes:
+    :return:
+    """
+    if config is None:
+        config = dict()
+    env = DeliveryEnv(config)
+    uav_ids = [agent for agent in env.possible_agents if agent.startswith("uav")]
+    actor = UAVActor().to(device)
+    critic = LSTMCritic().to(device)
+    optimizer_actor = optim.Adam(actor.parameters(), lr=lr_actor)
+    optimizer_critic = optim.Adam(critic.parameters(), lr=lr_critic)
+    stats = {'Actor Loss': [], 'Critic Loss': [], 'Returns': [], 'Time cost': []}
+
+    for episode in tqdm(range(1, num_episodes + 1)):
+        obs, info = env.reset(seed=None, options={'redistribute': False if episode % 20 != 0 else True})
+        episode_return = 0
+        env_termination = {agent: False for agent in env.possible_agents}
+
+        truck_route = plan_truck_route(obs["truck_0_0"]["nodes"].tolist(), list(info['center_node'].values()),
+                                       env.warehouse)
+        truck_route[1].append(env.num_customer)
+        # print("==" * 50)
+        while not all(env_termination.values()):
+            action_dict = {}
+
+            # Execute truck action if available
+            if obs['truck_0_0']['action_mask'] == 1 and len(truck_route[1]) > 0:
+                action_dict['truck_0_0'] = truck_route[1].pop(0)
+
+            # Execute UAV action if all UAV agents are ready
+            if all(obs[agent]['action_mask'] == 1 for agent in uav_ids):
+                score = actor(obs)
+                dist = Categorical(score)
+                action = dist.sample()
+                for i, agent in enumerate(uav_ids):
+                    action_dict[agent] = int(action[i].item())
+
+            next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
+
+            # If a UAV action was taken, update actor and critic using A2C
+            if any(agent in action_dict for agent in uav_ids):
+                reward = rewards['uav_0_0']
+                value = critic(obs)
+                next_value = critic(next_obs)
+                done_flag = all(terminations[agent] for agent in uav_ids)
+                td_target = reward + gamma * next_value * (1 - done_flag)
+                advantage = td_target - value
+
+                critic_loss = F.mse_loss(value, td_target.detach())
+                optimizer_critic.zero_grad()
+                critic_loss.backward()
+                optimizer_critic.step()
+
+                log_prob = dist.log_prob(action)
+                actor_loss = -log_prob * advantage.detach()
+                optimizer_actor.zero_grad()
+                actor_loss.backward()
+                optimizer_actor.step()
+
+                stats['Actor Loss'].append(actor_loss.item())
+                stats['Critic Loss'].append(critic_loss.item())
+
+            episode_return += sum(rewards.get(agent, 0) for agent in uav_ids)
+            env_termination = terminations
+            obs = next_obs
+
+        stats['Returns'].append(episode_return)
+        stats['Time cost'].append(info['cur_time_step'])
         # print(f"Episode {episode + 1}/{num_episodes} | Return: {episode_return}")
 
     torch.save(actor.state_dict(), f"uav_actor_{datetime.datetime.now()}.pth")
@@ -360,16 +448,17 @@ if __name__ == "__main__":
         "uav_num": 1,
         "uav_velocity": 5,
         "truck_velocity": 3,
-        "uav_power": 20,
-        "power_coefficient": 0.2,
+        "uav_power": 40,
+        "power_coefficient": 0.3,
         "num_customer": 300,
         "space_width": 30,
         "space_height": 25,
         "cluster_number": 7,
-        "max_step": 10_000
+        "max_step": 10_000,
+        "render_mode": "rgb_array",
     }
     testing_config = {
         "uav_num": 1,
         "num_customer": 10,
     }
-    train(testing_config, num_episodes=1)
+    train(training_config, num_episodes=100)

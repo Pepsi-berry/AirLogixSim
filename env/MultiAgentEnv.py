@@ -39,7 +39,7 @@ class UAVActionRet(Enum):
     OUT_OF_CAPACITY = 3  # uav will be out of capacity if it moves
     CLOSED_NODE = 4  # node has been assigned or delivered
     CANNOT_RETURN = 5  # uav cannot return to the truck if it moves
-    STAY_AT_TRUCK = 6  # uav choose truck repeatedly
+    SAME_TARGET = 6  # uav choose truck repeatedly
 
 
 class ColorFamily:
@@ -106,7 +106,7 @@ class DeliveryEnv(ParallelEnv):
         self.render_mode = config.get("render_mode", "human")
         self.space_width = config.get("space_width", 10)
         self.space_height = config.get("space_height", 10)
-        self.low_power_threshold = config.get("low_power_threshold", 30)
+        self.low_power_threshold = config.get("low_power_threshold", 0.5)
         self.power_coefficient = config.get("power_coefficient", 0.1)
         self.cluster_number = config.get("cluster_number", 3)
         self.map_width = 2 * self.space_width + 1
@@ -123,8 +123,8 @@ class DeliveryEnv(ParallelEnv):
             "uav_out_of_power_return": -10,
             "uav_closed_nodes": -10,
             "uav_current_target": -1,
-            "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10+distance*0.1-(self.uav_capacity-load)*0.5,
-            "uav_charging": lambda power: 5 if power < self.low_power_threshold else -5,
+            "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10+distance*0.1-(self.uav_capacity-load)*0.2,
+            "uav_charging": lambda power: 5 if power < self.low_power_threshold * self.uav_power else -10,
             "mission_completed": 100,
             "truck_current_target": -1,
             "truck_serve_customer": 1,
@@ -222,8 +222,19 @@ class DeliveryEnv(ParallelEnv):
         # reset the variables
         self.agents = copy(self.possible_agents)
         self.time_step = 0
-        self.nodes_location = self._generate_nodes()
-        self.nodes_weight = self._generate_parcel_weight()
+        self.infos = {"cur_time_step": self.time_step, "max_step": self.max_step, "num_customer": self.num_customer}
+
+        if self.nodes_location is None or options.get("redistribute", True):
+            while True:
+                self.kmeans = None
+                self.nodes_location = self._generate_nodes()
+                self.nodes_weight = self._generate_parcel_weight()
+                self._k_means_cluster()
+                if self._check_feasible():
+                    break
+        else:
+            self._k_means_cluster()  # get center_nodes
+
         self.node_mask = np.array([PackageState.WAITING.value] * self.num_customer)
         # self.node_mask = np.zeros(self.num_customer)
         self.warehouse = [0, 0]
@@ -251,29 +262,20 @@ class DeliveryEnv(ParallelEnv):
 
         self.terminations = {agent: False for agent in self.possible_agents}
         self.truncation = False
-        self.infos = {"cur_time_step": self.time_step, "max_step": self.max_step, "num_customer": self.num_customer}
 
-        self._k_means_cluster()
+
         observations = self._get_observations()
         return observations, self.infos
 
-    def step(self, action):
+    def step(self, action, training=False):
         """take a step in the environment
         For trucks, it can choose customer nodes and warehouse as its target. The action should range from [0, num_customer].
         For uavs, it can choose customer nodes and trucks as its target. The action should range from [0, num_customer + truck_num).
 
+        :param training: whether the step is for training
         :param action: the index of nodes.
         """
-        self.time_step += 1
-        self.infos["cur_time_step"] = self.time_step
-        if self.time_step > self.max_step:
-            self.truncation = True
-            observations = self._get_observations()
-            rewards = {agent: 0 for agent in self.possible_agents}
-            terminations = {agent: True for agent in self.possible_agents}
-            return observations, rewards, terminations, self.truncation, self.infos
-
-        rewards = {agent: self.reward_dict["every_time_step"] for agent in self.possible_agents}
+        rewards = {agent: 0 for agent in self.possible_agents}
         observations = self._get_observations()
 
         # update agent targets
@@ -334,159 +336,176 @@ class DeliveryEnv(ParallelEnv):
             else:
                 raise ValueError(f"Unknown action: {act}, agent: {agent}")
 
-        # move to target
-        for agent, target in self.agent_target.items():
-            if target is None:
-                continue
-            agent_coordinate = self.agent_coordinates[agent]
+        while all(not self._get_action_mask(agent) or self.terminations[agent] for agent in self.possible_agents):
+            self.time_step += 1
+            self.infos["cur_time_step"] = self.time_step
+            if self.time_step > self.max_step:
+                self.truncation = True
+                observations = self._get_observations()
+                rewards = {agent: 0 for agent in self.possible_agents}
+                terminations = {agent: True for agent in self.possible_agents}
+                return observations, rewards, terminations, self.truncation, self.infos
 
-            if type(target) is int:
-                target_coordinate = self.nodes_location[target]
-            elif target == 'warehouse':
-                target_coordinate = self.warehouse
-            elif target.startswith("truck"):
-                target_coordinate = self.agent_coordinates[target]
-            else:
-                raise ValueError(f"Unknown target: {target}, agent: {agent}")
+            for agent in self.possible_agents:
+                rewards[agent] += self.reward_dict["every_time_step"] if self.agent_target[agent] is not None else 0
 
-            distance = np.linalg.norm(np.array(target_coordinate) - np.array(agent_coordinate))
-            x_distance = target_coordinate[0] - agent_coordinate[0]
-            y_distance = target_coordinate[1] - agent_coordinate[1]
+            # move to target
+            for agent, target in self.agent_target.items():
+                if target is None:
+                    continue
+                agent_coordinate = self.agent_coordinates[agent]
 
-            if agent.startswith("uav"):
-                if self.cur_uav_capacity[agent] < 0 or self.cur_uav_power[agent] <= 0:  # dead
-                    rewards[agent] += self.reward_dict["uav_out_of_power"]
-                    if type(target) is int and target < self.num_customer:
-                        self.node_mask[target] = PackageState.WAITING.value
-                    self.cur_uav_capacity[agent] = self.uav_capacity
-                    self.cur_uav_power[agent] = self.uav_power
-                    self.cur_uav_travel_distance[agent] = 0
-                    self.agent_status[agent] = UAVState.IDLE.value
-                    self.agent_target[agent] = None
-                    group_num, _ = self._get_agent_group(agent)
-                    self.agent_coordinates[agent] = self.agent_coordinates[f"truck_{group_num}_0"]
-                elif type(target) is str and target.startswith(
-                        "truck") and distance <= self.uav_velocity:  # return to truck
-                    group_num, _ = self._get_agent_group(agent)
-                    self.truck_loaded_uav[f"truck_{group_num}_0"].add(agent)  # register uav
-                    self.agent_coordinates[agent] = target_coordinate
-                    rewards[agent] += self.reward_dict["uav_round_trip"](self.cur_uav_travel_distance[agent], self.cur_uav_capacity[agent])
-                    rewards[agent] += self.reward_dict["uav_charging"](self.cur_uav_power[agent])
-                    self.cur_uav_travel_distance[agent] = 0
-                    self.cur_uav_power[agent] = self.uav_power
-                    self.cur_uav_capacity[agent] = self.uav_capacity
-                    self.agent_status[agent] = UAVState.IDLE.value
-                    self.agent_target[agent] = None
-                    self.truck_loaded_uav[target].add(agent)
-                elif distance <= self.uav_velocity:
-                    self.agent_coordinates[agent] = target_coordinate
-                    self.cur_uav_travel_distance[agent] += distance
-                    self.cur_uav_power[agent] -= self._calc_power_consumption(
-                        (self.nodes_weight[target] + self.uav_weight), distance)
-                    self.agent_status[agent] = UAVState.LANDING.value
-                    self.node_mask[target] = PackageState.DELIVERED.value
-                    self.agent_target[agent] = None
+                if type(target) is int:
+                    target_coordinate = self.nodes_location[target]
+                elif target == 'warehouse':
+                    target_coordinate = self.warehouse
+                elif target.startswith("truck"):
+                    target_coordinate = self.agent_coordinates[target]
                 else:
-                    self.agent_coordinates[agent] = (
-                        agent_coordinate[0] + x_distance * self.uav_velocity / distance,
-                        agent_coordinate[1] + y_distance * self.uav_velocity / distance)
-                    self.cur_uav_travel_distance[agent] += self.uav_velocity
+                    raise ValueError(f"Unknown target: {target}, agent: {agent}")
 
-                    cur_uav_load = 0 if type(target) is str and target.startswith("truck") else self.nodes_weight[
-                        target]
-                    self.cur_uav_power[agent] -= self._calc_power_consumption(cur_uav_load + self.uav_weight,
-                                                                              self.uav_velocity)
-            else:
-                group_num, _ = self._get_agent_group(agent)
-                available_step = self.truck_velocity
-                while available_step > 10e-14:
-                    if abs(self.agent_coordinates[agent][0] - target_coordinate[0]) > 10e-14:
-                        length = min(available_step, abs(x_distance))
-                        direction = 1 if x_distance > 0 else -1
-                        self.agent_coordinates[agent] = (
-                            self.agent_coordinates[agent][0] + direction * length, self.agent_coordinates[agent][1])
-                        available_step -= length
-                        for uav in self.truck_loaded_uav[agent]:
-                            self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                    elif abs(self.agent_coordinates[agent][1] - target_coordinate[1]) > 10e-14:
-                        length = min(available_step, abs(y_distance))
-                        direction = 1 if y_distance > 0 else -1
-                        self.agent_coordinates[agent] = (
-                            self.agent_coordinates[agent][0], self.agent_coordinates[agent][1] + direction * length)
-                        available_step -= length
-                        for uav in self.truck_loaded_uav[agent]:
-                            self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                    else:
-                        self.agent_coordinates[agent] = target_coordinate
-                        self.agent_status[agent] = TruckState.LANDING.value
+                distance = np.linalg.norm(np.array(target_coordinate) - np.array(agent_coordinate))
+                x_distance = target_coordinate[0] - agent_coordinate[0]
+                y_distance = target_coordinate[1] - agent_coordinate[1]
+
+                if agent.startswith("uav"):
+                    if self.cur_uav_capacity[agent] < 0 or self.cur_uav_power[agent] <= 0:  # dead
+                        rewards[agent] += self.reward_dict["uav_out_of_power"]
+                        if type(target) is int and target < self.num_customer:
+                            self.node_mask[target] = PackageState.WAITING.value
+                        self.cur_uav_capacity[agent] = self.uav_capacity
+                        self.cur_uav_power[agent] = self.uav_power
+                        self.cur_uav_travel_distance[agent] = 0
+                        self.agent_status[agent] = UAVState.IDLE.value
                         self.agent_target[agent] = None
-                        if target != 'warehouse':
-                            self.node_mask[target] = PackageState.DELIVERED.value
+                        group_num, _ = self._get_agent_group(agent)
+                        self.agent_coordinates[agent] = self.agent_coordinates[f"truck_{group_num}_0"]
+                    elif type(target) is str and target.startswith(
+                            "truck") and distance <= self.uav_velocity:  # return to truck
+                        group_num, _ = self._get_agent_group(agent)
+                        self.truck_loaded_uav[f"truck_{group_num}_0"].add(agent)  # register uav
+                        self.agent_coordinates[agent] = target_coordinate
+                        rewards[agent] += self.reward_dict["uav_round_trip"](self.cur_uav_travel_distance[agent], self.cur_uav_capacity[agent])
+                        rewards[agent] += self.reward_dict["uav_charging"](self.cur_uav_power[agent])
+                        self.cur_uav_travel_distance[agent] = 0
+                        self.cur_uav_power[agent] = self.uav_power
+                        self.cur_uav_capacity[agent] = self.uav_capacity
+                        self.agent_status[agent] = UAVState.IDLE.value
+                        self.agent_target[agent] = None
+                        self.truck_loaded_uav[target].add(agent)
+                    elif distance <= self.uav_velocity:
+                        self.agent_coordinates[agent] = target_coordinate
+                        self.cur_uav_travel_distance[agent] += distance
+                        self.cur_uav_power[agent] -= self._calc_power_consumption(
+                            (self.nodes_weight[target] + self.uav_weight), distance)
+                        self.agent_status[agent] = UAVState.LANDING.value
+                        self.node_mask[target] = PackageState.DELIVERED.value
+                        self.agent_target[agent] = None
+                    else:
+                        self.agent_coordinates[agent] = (
+                            agent_coordinate[0] + x_distance * self.uav_velocity / distance,
+                            agent_coordinate[1] + y_distance * self.uav_velocity / distance)
+                        self.cur_uav_travel_distance[agent] += self.uav_velocity
+
+                        cur_uav_load = 0 if type(target) is str and target.startswith("truck") else self.nodes_weight[
+                            target]
+                        self.cur_uav_power[agent] -= self._calc_power_consumption(cur_uav_load + self.uav_weight,
+                                                                                  self.uav_velocity)
+                else:
+                    group_num, _ = self._get_agent_group(agent)
+                    available_step = self.truck_velocity
+                    while available_step > 10e-14:
+                        if abs(self.agent_coordinates[agent][0] - target_coordinate[0]) > 10e-14:
+                            length = min(available_step, abs(x_distance))
+                            direction = 1 if x_distance > 0 else -1
+                            self.agent_coordinates[agent] = (
+                                self.agent_coordinates[agent][0] + direction * length, self.agent_coordinates[agent][1])
+                            available_step -= length
                             for uav in self.truck_loaded_uav[agent]:
-                                self.terminations[uav] = False  # open for delivery
-                                self.agent_status[uav] = UAVState.IDLE.value
-                            rewards[agent] += self.reward_dict["truck_serve_customer"]
+                                self.agent_coordinates[uav] = self.agent_coordinates[agent]
+                        elif abs(self.agent_coordinates[agent][1] - target_coordinate[1]) > 10e-14:
+                            length = min(available_step, abs(y_distance))
+                            direction = 1 if y_distance > 0 else -1
+                            self.agent_coordinates[agent] = (
+                                self.agent_coordinates[agent][0], self.agent_coordinates[agent][1] + direction * length)
+                            available_step -= length
+                            for uav in self.truck_loaded_uav[agent]:
+                                self.agent_coordinates[uav] = self.agent_coordinates[agent]
                         else:
+                            self.agent_coordinates[agent] = target_coordinate
                             self.agent_status[agent] = TruckState.LANDING.value
-                            if np.all(self.node_mask == PackageState.DELIVERED.value):
-                                for every_agent in self.possible_agents:
-                                    rewards[every_agent] += self.reward_dict["mission_completed"]
-                                self.terminations[agent] = True
+                            self.agent_target[agent] = None
+                            if target != 'warehouse':
+                                self.node_mask[target] = PackageState.DELIVERED.value
+                                for uav in self.truck_loaded_uav[agent]:
+                                    self.terminations[uav] = False  # open for delivery
+                                    self.agent_status[uav] = UAVState.IDLE.value
+                                rewards[agent] += self.reward_dict["truck_serve_customer"]
                             else:
-                                rewards[agent] += self.reward_dict["truck_illegal_return"]
-                        break
+                                self.agent_status[agent] = TruckState.LANDING.value
+                                if np.all(self.node_mask == PackageState.DELIVERED.value):
+                                    for every_agent in self.possible_agents:
+                                        rewards[every_agent] += self.reward_dict["mission_completed"]
+                                    self.terminations[agent] = True
+                                else:
+                                    rewards[agent] += self.reward_dict["truck_illegal_return"]
+                            break
 
-                # for x in range(self.truck_velocity):
-                #     if agent_coordinate[0] != target_coordinate[0]:
-                #         direction = 1 if x_distance > 0 else -1
-                #         self.agent_coordinates[agent] = (agent_coordinate[0] + direction, agent_coordinate[1])
-                #         for uav in self.truck_loaded_uav[agent]:
-                #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                #     elif agent_coordinate[1] != target_coordinate[1]:
-                #         direction = 1 if y_distance > 0 else -1
-                #         self.agent_coordinates[agent] = (agent_coordinate[0], agent_coordinate[1] + direction)
-                #         for uav in self.truck_loaded_uav[agent]:
-                #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
-                #     else:  # target is reached
-                #         self.agent_status[agent] = TruckState.LANDING.value
-                #         self.agent_target[agent] = None
-                #         if target != 'warehouse':
-                #             self.node_mask[target] = PackageState.DELIVERED.value
-                #             for uav in self.truck_loaded_uav[agent]:
-                #                 self.terminations[uav] = False  # open for delivery
-                #                 self.agent_status[uav] = UAVState.IDLE.value
-                #             rewards[agent] += 1
-                #         else:
-                #             self.agent_status[agent] = TruckState.LANDING.value
-                #             if np.all(self.node_mask == PackageState.DELIVERED.value):
-                #                 for every_agent in self.possible_agents:
-                #                     rewards[every_agent] += 100
-                #                 self.terminations[agent] = True
-                #             else:
-                #                 rewards[agent] += -10
-                #         break
+                    # for x in range(self.truck_velocity):
+                    #     if agent_coordinate[0] != target_coordinate[0]:
+                    #         direction = 1 if x_distance > 0 else -1
+                    #         self.agent_coordinates[agent] = (agent_coordinate[0] + direction, agent_coordinate[1])
+                    #         for uav in self.truck_loaded_uav[agent]:
+                    #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
+                    #     elif agent_coordinate[1] != target_coordinate[1]:
+                    #         direction = 1 if y_distance > 0 else -1
+                    #         self.agent_coordinates[agent] = (agent_coordinate[0], agent_coordinate[1] + direction)
+                    #         for uav in self.truck_loaded_uav[agent]:
+                    #             self.agent_coordinates[uav] = self.agent_coordinates[agent]
+                    #     else:  # target is reached
+                    #         self.agent_status[agent] = TruckState.LANDING.value
+                    #         self.agent_target[agent] = None
+                    #         if target != 'warehouse':
+                    #             self.node_mask[target] = PackageState.DELIVERED.value
+                    #             for uav in self.truck_loaded_uav[agent]:
+                    #                 self.terminations[uav] = False  # open for delivery
+                    #                 self.agent_status[uav] = UAVState.IDLE.value
+                    #             rewards[agent] += 1
+                    #         else:
+                    #             self.agent_status[agent] = TruckState.LANDING.value
+                    #             if np.all(self.node_mask == PackageState.DELIVERED.value):
+                    #                 for every_agent in self.possible_agents:
+                    #                     rewards[every_agent] += 100
+                    #                 self.terminations[agent] = True
+                    #             else:
+                    #                 rewards[agent] += -10
+                    #         break
 
-        # Only when all clusters are delivered, all uavs return to the truck and truck is at warehouse, the truck can move.
-        for agent in self.possible_agents:
-            group_num, _ = self._get_agent_group(agent)
-            if agent.startswith("uav") and self.group_assigned[group_num] is None and all(
-                    x == PackageState.DELIVERED.value for x in self.node_mask):
-                self.terminations[agent] = True
-            elif agent.startswith("uav") and self.group_assigned[group_num] is None:
-                self.terminations[agent] = False
-            elif agent.startswith("uav"):
-                # self.terminations[agent] = self._is_cluster_delivered(
-                #     self.group_assigned[group_num]) and self._get_action_mask(agent)
-                self.terminations[agent] = self._is_cluster_delivered(
-                    self.group_assigned[group_num]) and self.agent_status[agent] == UAVState.IDLE.value
-            else:  # truck
-                self.terminations[agent] = (self._get_action_mask(agent)
-                                            and np.array_equal(np.array(self.agent_coordinates[agent]),
-                                                               np.array(self.warehouse))
-                                            and all(
-                            self._is_cluster_delivered(cluster) for cluster in range(self.cluster_number)))
+            # Only when all clusters are delivered, all uavs return to the truck and truck is at warehouse, the truck can move.
+            for agent in self.possible_agents:
+                group_num, _ = self._get_agent_group(agent)
+                if agent.startswith("uav") and self.group_assigned[group_num] is None and all(
+                        x == PackageState.DELIVERED.value for x in self.node_mask):
+                    self.terminations[agent] = True
+                elif agent.startswith("uav") and self.group_assigned[group_num] is None:
+                    self.terminations[agent] = False
+                elif agent.startswith("uav"):
+                    # self.terminations[agent] = self._is_cluster_delivered(
+                    #     self.group_assigned[group_num]) and self._get_action_mask(agent)
+                    self.terminations[agent] = self._is_cluster_delivered(
+                        self.group_assigned[group_num]) and self.agent_status[agent] == UAVState.IDLE.value
+                else:  # truck
+                    self.terminations[agent] = (self._get_action_mask(agent)
+                                                and np.array_equal(np.array(self.agent_coordinates[agent]),
+                                                                   np.array(self.warehouse))
+                                                and all(
+                                self._is_cluster_delivered(cluster) for cluster in range(self.cluster_number)))
 
-        observations = self._get_observations()
+            observations = self._get_observations()
+            if not training or all(self.terminations[agent] for agent in self.possible_agents):
+                break
+            else:
+                self.render()
         return observations, rewards, self.terminations, self.truncation, self.infos
 
     def render(self):
@@ -555,7 +574,9 @@ class DeliveryEnv(ParallelEnv):
                 obs["choice_mask"] = np.zeros(self.num_customer + self.truck_num)
                 for x in range(self.num_customer + self.truck_num):
                     if x < self.num_customer:
-                        if self.node_mask[x] != PackageState.WAITING.value:
+                        if np.array_equal(np.array(self.agent_coordinates[agent]), np.array(self.nodes_location[x])):
+                            obs["choice_mask"][x] = UAVActionRet.SAME_TARGET.value
+                        elif self.node_mask[x] != PackageState.WAITING.value:
                             obs["choice_mask"][x] = UAVActionRet.CLOSED_NODE.value
                         elif self.group_assigned[group_num] is None or self.group_assigned[group_num] is not None and self._get_k_means_cluster(
                                 self.nodes_location[x]) != self.group_assigned[group_num]:
@@ -582,7 +603,7 @@ class DeliveryEnv(ParallelEnv):
                                 obs["choice_mask"][x] = UAVActionRet.FEASIBLE.value
                     else:
                         if np.array_equal(np.array(self.agent_coordinates[agent]), self.agent_coordinates[f"truck_{group_num}_{x-self.num_customer}"]):
-                            obs["choice_mask"][x] = UAVActionRet.STAY_AT_TRUCK.value
+                            obs["choice_mask"][x] = UAVActionRet.SAME_TARGET.value
                         else:
                             return_power = self._calc_power_consumption(self.uav_weight, self._calc_distance(
                                 self.agent_coordinates[agent], self.agent_coordinates[f"truck_{group_num}_0"]))
@@ -658,8 +679,9 @@ class DeliveryEnv(ParallelEnv):
     def _k_means_cluster(self):
         """k-means cluster the nodes
         """
-        self.kmeans = KMeans(n_clusters=self.cluster_number, random_state=0)
-        self.kmeans.fit(self.nodes_location)
+        if self.kmeans is None:
+            self.kmeans = KMeans(n_clusters=self.cluster_number, random_state=0)
+            self.kmeans.fit(self.nodes_location)
 
         elements = []
         for cluster in range(self.kmeans.n_clusters):
@@ -703,6 +725,20 @@ class DeliveryEnv(ParallelEnv):
             return None
         new_coordinate = np.array([coordinates])
         return self.kmeans.predict(new_coordinate)[0]
+
+    def _check_feasible(self):
+        if self.kmeans is None or self.nodes_location is None:
+            return False
+        for i in range(self.cluster_number):
+            center = self.infos["center_node"][i]
+            nodes = self.infos["cluster_mask"][i]
+            for node in nodes:
+                weight = self.nodes_weight[node]
+                dist = self._calc_distance(self.nodes_location[center], self.nodes_location[node])
+                rtt_power = self._calc_power_consumption(self.uav_weight+weight, dist) + self._calc_power_consumption(self.uav_weight, dist)
+                if rtt_power > self.uav_power:
+                    return False
+        return True
 
     def _is_cluster_delivered(self, cluster):
         """check if the cluster is delivered
