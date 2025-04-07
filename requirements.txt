@@ -6,3 +6,5 @@ gymnasium
 scikit-learn
 torch
 tqdm
+matplotlib
+cloudpickle

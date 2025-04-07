@@ -47,20 +47,23 @@ def buildStateTensor(obs):
 
     # Concatenate candidates: customers first, then trucks.
     candidates = torch.cat([customers, trucks], dim=1)  # (batch, num_candidates, 3)
-    candidates = torch.cat([candidates, choice_mask], dim=-1)  # (batch, num_candidates, 4)
+    # candidates = torch.cat([candidates, choice_mask], dim=-1)  # (batch, num_candidates, 4)
 
     return candidates
 
 
 class UAVCritics(nn.Module):
-    def __init__(self, feature_dim=4, candidate_embed_dim=128):
+    def __init__(self, feature_dim=3, embed_dim=128, dropout=0.1, nhead=4):
         super(UAVCritics, self).__init__()
-        # Critic branch: projects the query vector to a scalar value.
-        self.critic = nn.Sequential(
-            nn.Linear(feature_dim, candidate_embed_dim),
-            nn.ReLU(),
-            nn.Linear(candidate_embed_dim, 1)
-        )
+        self.linear_proj = nn.Linear(feature_dim, embed_dim)
+        self.encoder = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=embed_dim,
+                                                                        nhead=nhead,
+                                                                        dropout=dropout,
+                                                                        batch_first=True), num_layers=3)
+        self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=embed_dim,
+                                                                        nhead=nhead,
+                                                                        dropout=dropout,
+                                                                        batch_first=True), num_layers=3)
 
     def forward(self, obs):
         """
@@ -71,13 +74,14 @@ class UAVCritics(nn.Module):
         """
         batch = build_batch(obs)
         state_tensor = buildStateTensor(batch)
-        value = self.critic(state_tensor).squeeze(-1)
-        value = F.softmax(value, dim=-1)
-        return value
+        linear_proj = self.linear_proj(state_tensor)
+        encoder_out = self.encoder(linear_proj)
+        decoder_out = self.decoder(encoder_out, memory=encoder_out)
+        return decoder_out.mean()
 
 
 class LSTMCritic(nn.Module):
-    def __init__(self, input_dim=4, hidden_dim=128):
+    def __init__(self, input_dim=3, hidden_dim=128):
         super().__init__()
         # input_dim = feature_dim
         self.lstm = nn.LSTM(input_size=input_dim, hidden_size=hidden_dim, batch_first=True)
@@ -131,19 +135,20 @@ class AttentionLayer(nn.Module):
                                                       nhead=nhead,
                                                       dropout=dropout,
                                                       batch_first=True)
-        self.feed_forward = nn.Linear(embed_dim, embed_dim)
-        self.bn1 = nn.BatchNorm1d(embed_dim)
-        self.bn2 = nn.BatchNorm1d(embed_dim)
+        # self.feed_forward = nn.Linear(embed_dim, embed_dim)
+        # self.bn1 = nn.BatchNorm1d(embed_dim)
+        # self.bn2 = nn.BatchNorm1d(embed_dim)
 
     def forward(self, x):
         after_transformer = self.transformer(x)
-        add1 = x + after_transformer
-        bn1 = self.bn1(add1.transpose(1, 2))
-        bn1 = bn1.transpose(1, 2)
-        after_feat = self.feed_forward(bn1)
-        add2 = bn1 + after_feat
-        bn2 = self.bn2(add2.transpose(1, 2))
-        return bn2.transpose(1, 2)
+        return after_transformer
+        # add1 = x + after_transformer
+        # bn1 = self.bn1(add1.transpose(1, 2))
+        # bn1 = bn1.transpose(1, 2)
+        # after_feat = self.feed_forward(bn1)
+        # add2 = bn1 + after_feat
+        # bn2 = self.bn2(add2.transpose(1, 2))
+        # return bn2.transpose(1, 2)
 
 
 class Encoder(nn.Module):
@@ -151,7 +156,7 @@ class Encoder(nn.Module):
                  embed_dim=128,
                  nhead=4,
                  num_layers=2,
-                 feature_dim=4
+                 feature_dim=3
                  ):
         super(Encoder, self).__init__()
         self.linear_proj = nn.Linear(feature_dim, embed_dim)
@@ -207,7 +212,9 @@ class UAVActor(nn.Module):
         score = self.decoder(last_target, x_mean, batch, latest) / self.scale
 
         # masked softmax
-        infeasible = torch.Tensor(batch["choice_mask"] != 0)
+        # infeasible = torch.logical_and(batch["choice_mask"] == UAVActionRet.CLOSED_NODE.value,
+        #                                batch["choice_mask"] == UAVActionRet.SAME_TARGET.value)
+        infeasible = torch.Tensor(batch['choice_mask'] != UAVActionRet.FEASIBLE.value).to(device)
         score = score.masked_fill(infeasible, -1e9)
         probs = F.softmax(score, dim=-1)
         return probs
