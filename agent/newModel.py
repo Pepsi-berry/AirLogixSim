@@ -2,54 +2,12 @@ import math
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import numpy as np
-from torch.distributions import Categorical
-import datetime
-import matplotlib.pyplot as plt
-
-from env.MultiAgentEnv import DeliveryEnv, UAVActionRet
-from agent.truck import plan_truck_route
-from tqdm import tqdm
+from env.MultiAgentEnv import UAVActionRet
+from util.obs_process import build_batch, buildStateTensor
+from util.get_device import get_device
 
 # Set device
-device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
-
-
-def build_batch(obs):
-    uav_ids = [agent for agent in obs.keys() if agent.startswith("uav")]
-    keys = ["nodes", "parcel", "truck", "coordinate", "power", "capacity", "travel_distance", "choice_mask"]
-    batch = {}
-    for key in keys:
-        # Convert each field to a tensor and stack over UAV agents.
-        batch[key] = torch.stack([torch.tensor(obs[agent][key]) for agent in uav_ids], dim=0).float().to(device)
-    return batch
-
-
-def buildStateTensor(obs):
-    # Process customer nodes.
-    customers = obs["nodes"]  # (batch, num_customer, 2)
-    if obs["parcel"].dim() == 2:
-        parcel = obs["parcel"].unsqueeze(-1)  # (batch, num_customer, 1)
-    else:
-        parcel = obs["parcel"]
-    if obs["choice_mask"].dim() == 2:
-        choice_mask = obs["choice_mask"].unsqueeze(-1)
-    else:
-        choice_mask = obs["choice_mask"]
-    customers = torch.cat([customers, parcel], dim=-1)  # (batch, num_customer, 3)
-
-    # Process truck nodes.
-    trucks = obs["truck"]  # (batch, truck_num, 2)
-    dummy_weight = torch.zeros(trucks.size(0), 1, device=trucks.device)
-    trucks = torch.cat([trucks, dummy_weight], dim=-1).unsqueeze(1)  # (batch, truck_num, 3)
-
-    # Concatenate candidates: customers first, then trucks.
-    candidates = torch.cat([customers, trucks], dim=1)  # (batch, num_candidates, 3)
-    # candidates = torch.cat([candidates, choice_mask], dim=-1)  # (batch, num_candidates, 4)
-
-    return candidates
+device = get_device()
 
 
 class UAVCritics(nn.Module):
@@ -73,7 +31,7 @@ class UAVCritics(nn.Module):
             value: Tensor of shape (batch, 1) with the state value estimate.
         """
         batch = build_batch(obs)
-        state_tensor = buildStateTensor(batch)
+        state_tensor = buildStateTensor(batch, device=device)
         linear_proj = self.linear_proj(state_tensor)
         encoder_out = self.encoder(linear_proj)
         decoder_out = self.decoder(encoder_out, memory=encoder_out)
@@ -94,7 +52,7 @@ class LSTMCritic(nn.Module):
         Returns a value estimate of shape [batch_size, 1]
         """
         batch = build_batch(obs)
-        x = buildStateTensor(batch)
+        x = buildStateTensor(batch, device=device)
         # out: [batch_size, seq_length, hidden_dim]
         # (h_n, c_n): last hidden & cell states, shape of h_n is [num_layers, batch_size, hidden_dim]
         out, (h_n, c_n) = self.lstm(x)
@@ -123,7 +81,7 @@ class DecisionAttention(nn.Module):
         dist_emb = self.dist_linear(dist_expanded)  # [1, 21, 128]
         attn_input = torch.tanh(combined_expanded + dist_emb)  # [1, 21, 128]
         scores = self.v(attn_input).squeeze(-1)  # [1, 21]
-        scores = F.softmax(scores, dim=1)
+        # scores = F.softmax(scores, dim=1)
         return scores  # softmax is added later
 
 
@@ -156,15 +114,23 @@ class Encoder(nn.Module):
                  embed_dim=128,
                  nhead=4,
                  num_layers=2,
-                 feature_dim=3
+                 feature_dim=3,
+                 dropout=0.1,
                  ):
         super(Encoder, self).__init__()
         self.linear_proj = nn.Linear(feature_dim, embed_dim)
-        layers = [AttentionLayer(embed_dim, nhead) for _ in range(num_layers)]
-        self.attention = nn.Sequential(*layers)
+        self.attention = nn.TransformerEncoder(
+            encoder_layer=nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=nhead,
+                dropout=dropout,
+                batch_first=True
+            ),
+            num_layers=num_layers
+        )
 
-    def forward(self, obs):
-        candidates = buildStateTensor(obs)
+    def forward(self, batch):
+        candidates = buildStateTensor(batch, device=device)
         linear_proj = self.linear_proj(candidates)  # (batch, num_candidates, candidate_embed_dim)
         embed = self.attention(linear_proj)
         return embed
@@ -177,12 +143,12 @@ class Decoder(nn.Module):
         self.status_linear_proj = nn.Linear(3, embed_dim)
         self.attention = DecisionAttention(embed_dim)
 
-    def forward(self, embed_last, embed_mean, obs, latest):
-        nodes = obs["nodes"]
-        nodes = torch.cat([nodes, obs["truck"].unsqueeze(1)], dim=1)
-        dist_vec = torch.cdist(nodes, nodes, p=2)[:, latest, :]
-        status = torch.cat([obs["power"], obs["capacity"], obs["travel_distance"]], dim=-1)
-        proj = self.status_linear_proj(status).unsqueeze(1).transpose(0, 1)
+    def forward(self, embed_last, embed_mean, batch, latest):
+        nodes = torch.cat([batch["nodes"], batch["truck"].unsqueeze(1)], dim=1).to(device)
+        dist_vec = torch.cdist(nodes, nodes, p=2)
+        dist_vec = dist_vec[torch.arange(dist_vec.size(0)), latest, :]
+        status = torch.cat([batch["power"].unsqueeze(-1), batch["capacity"].unsqueeze(-1), batch["travel_distance"].unsqueeze(-1)], dim=-1).to(device)
+        proj = self.status_linear_proj(status)
         lstm_out, (h_n, c_n) = self.lstm(embed_last)
         # print(f"dist_vec: {dist_vec.shape}, proj: {proj.shape}, hn: {h_n.shape}, embed_mean: {embed_mean.shape}")
         score = self.attention(dist_vec, h_n, proj, embed_mean)
@@ -191,6 +157,7 @@ class Decoder(nn.Module):
 
 class UAVActor(nn.Module):
     def __init__(self,
+                 feature_dim=3,
                  embed_dim=128,
                  attention_nhead=4,
                  attention_num_layers=2,
@@ -198,274 +165,77 @@ class UAVActor(nn.Module):
                  lstm_hidden_dim=128,
                  ):
         super(UAVActor, self).__init__()
-        self.encoder = Encoder(embed_dim, attention_nhead, attention_num_layers)
+        self.encoder = Encoder(feature_dim=feature_dim, embed_dim=embed_dim, nhead=attention_nhead,
+                               num_layers=attention_num_layers)
         self.decoder = Decoder(embed_dim, lstm_num_layers, lstm_hidden_dim)
         self.scale = math.sqrt(embed_dim)
 
     def forward(self, obs):
-        latest = np.where(obs["uav_0_0"]["choice_mask"] == UAVActionRet.SAME_TARGET.value)[0][0]
         batch = build_batch(obs)
+        latest = torch.argmax(batch["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value, dim=1)
         x = self.encoder(batch)
         x_mean = x.mean(dim=1)
         # print(x_mean.shape)  # (batch, candidate_embed_dim)
-        last_target = x[:, latest, :]
+        last_target = x[torch.arange(x.size(0)), latest, :]
         score = self.decoder(last_target, x_mean, batch, latest) / self.scale
 
-        # masked softmax
+        # masked out infeasible actions
         # infeasible = torch.logical_and(batch["choice_mask"] == UAVActionRet.CLOSED_NODE.value,
         #                                batch["choice_mask"] == UAVActionRet.SAME_TARGET.value)
         infeasible = torch.Tensor(batch['choice_mask'] != UAVActionRet.FEASIBLE.value).to(device)
         score = score.masked_fill(infeasible, -1e9)
-        probs = F.softmax(score, dim=-1)
-        return probs
-
-
-def old_train(config=None, gamma=0.99, lr_actor=1e-1, lr_critic=1e-1, num_episodes=1000):
-    """
-    score = actor(obs)  # (batch, num_candidates)
-    value = critic(obs)  # (batch, num_candidates)
-    :param config:
-    :param gamma:
-    :param lr_actor:
-    :param lr_critic:
-    :param num_episodes:
-    :return:
-    """
-    if config is None:
-        config = dict()
-    env = DeliveryEnv(config)
-    uav_ids = [agent for agent in env.possible_agents if agent.startswith("uav")]
-    actor = UAVActor().to(device)
-    critic = LSTMCritic().to(device)
-    optimizer_actor = optim.Adam(actor.parameters(), lr=lr_actor)
-    optimizer_critic = optim.Adam(critic.parameters(), lr=lr_critic)
-    stats = {'Actor Loss': [], 'Critic Loss': [], 'Returns': [], 'Time cost': []}
-
-    for episode in range(1, num_episodes + 1):
-        obs, info = env.reset(seed=None, options={'redistribute': False})
-        done = False
-        episode_return = 0
-        env_termination = {agent: False for agent in env.possible_agents}
-
-        truck_route = plan_truck_route(obs["truck_0_0"]["nodes"].tolist(), list(info['center_node'].values()),
-                                       env.warehouse)
-        truck_route[1].append(env.num_customer)
-        print("==" * 50)
-        while not all(env_termination.values()):
-            if obs['truck_0_0']['action_mask'] == 1:
-                try:
-                    action_dict = {f'truck_0_0': truck_route[1].pop(0)}
-                except IndexError as e:
-                    break
-                next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
-                # cur_reward = sum(rewards[agent] for agent in uav_ids)
-                # done = all(terminations.values())
-                #
-                # value = critic(obs)
-                # next_value = critic(next_obs)
-
-                # td_target = cur_reward + gamma * next_value * (1 - done)
-                # critic_loss = F.mse_loss(value, td_target.detach())
-                # optimizer_critic.zero_grad()
-                # critic_loss.backward()
-                # optimizer_critic.step()
-
-                episode_return += sum(rewards[agent] for agent in uav_ids)
-                env_termination = terminations
-                obs = next_obs
-            elif all(obs[agent]['action_mask'] == 1 for agent in uav_ids):
-                while not all(done if agent.startswith("uav") else True for agent, done in env_termination.items()):
-                    if obs['uav_0_0']['action_mask'] != 1:
-                        continue
-
-                    score = actor(obs)
-                    print(score)
-                    dist = Categorical(score)
-                    action = dist.sample()
-                    # Construct action dictionary for UAV agents.
-                    action_dict = {}
-                    for i, agent in enumerate(uav_ids):
-                        if obs[agent]['action_mask'] == 1:
-                            action_dict[agent] = int(action[i].item())
-                    next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
-                    reward = rewards['uav_0_0']
-                    done = all(done if agent.startswith("uav") else True for agent, done in env_termination.items())
-
-                    value = critic(obs)
-                    next_value = critic(next_obs)
-
-                    td_target = reward + gamma * next_value * (1 - done)
-                    advantage = td_target - value
-
-                    critic_loss = F.mse_loss(value, td_target.detach())
-                    optimizer_critic.zero_grad()
-                    critic_loss.backward()
-                    optimizer_critic.step()
-
-                    log_prob = dist.log_prob(action)
-                    actor_loss = -log_prob * advantage.detach()
-                    optimizer_actor.zero_grad()
-                    actor_loss.backward()
-                    optimizer_actor.step()
-
-                    env_termination = terminations
-                    obs = next_obs
-                    cur_reward = 0
-
-                    stats['Actor Loss'].append(actor_loss.item())
-                    stats['Critic Loss'].append(critic_loss.item())
-
-                    # env.render()
-            else:
-                action_dict = {}
-                next_obs, rewards, terminations, truncation, info = env.step(action_dict)
-
-                episode_return += sum(rewards[agent] for agent in uav_ids)
-                env_termination = terminations
-                obs = next_obs
-
-            # env.render()
-
-        stats['Returns'].append(episode_return)
-        stats['Time cost'].append(info['cur_time_step'])
-        # print(f"Episode {episode + 1}/{num_episodes} | Return: {episode_return}")
-
-    torch.save(actor.state_dict(), f"uav_actor_{datetime.datetime.now()}.pth")
-    torch.save(critic.state_dict(), f"uav_critic_{datetime.datetime.now()}.pth")
-
-    # draw episode-return graph and save
-    plt.plot(stats['Returns'])
-    plt.xlabel('Episode')
-    plt.ylabel('Return')
-    plt.title('Episode-Return Graph')
-    plt.savefig(f'episode_return_graph_{datetime.datetime.now()}.png')
-
-    # draw episode-timecost graph and save
-    plt.figure()
-    plt.plot(stats['Time cost'])
-    plt.xlabel('Episode')
-    plt.ylabel('Time cost')
-    plt.title('Episode-Time Cost Graph')
-    plt.savefig(f'episode_timecost_graph_{datetime.datetime.now()}.png')
-
-    env.close()
-
-
-def train(config=None, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3, num_episodes=1000):
-    """
-    score = actor(obs)  # (batch, num_candidates)
-    value = critic(obs)  # (batch, num_candidates)
-    :param config:
-    :param gamma:
-    :param lr_actor:
-    :param lr_critic:
-    :param num_episodes:
-    :return:
-    """
-    if config is None:
-        config = dict()
-    env = DeliveryEnv(config)
-    uav_ids = [agent for agent in env.possible_agents if agent.startswith("uav")]
-    actor = UAVActor().to(device)
-    critic = LSTMCritic().to(device)
-    optimizer_actor = optim.Adam(actor.parameters(), lr=lr_actor)
-    optimizer_critic = optim.Adam(critic.parameters(), lr=lr_critic)
-    stats = {'Actor Loss': [], 'Critic Loss': [], 'Returns': [], 'Time cost': []}
-
-    for episode in tqdm(range(1, num_episodes + 1)):
-        obs, info = env.reset(seed=None, options={'redistribute': False if episode % 20 != 0 else True})
-        episode_return = 0
-        env_termination = {agent: False for agent in env.possible_agents}
-
-        truck_route = plan_truck_route(obs["truck_0_0"]["nodes"].tolist(), list(info['center_node'].values()),
-                                       env.warehouse)
-        truck_route[1].append(env.num_customer)
-        # print("==" * 50)
-        while not all(env_termination.values()):
-            action_dict = {}
-
-            # Execute truck action if available
-            if obs['truck_0_0']['action_mask'] == 1 and len(truck_route[1]) > 0:
-                action_dict['truck_0_0'] = truck_route[1].pop(0)
-
-            # Execute UAV action if all UAV agents are ready
-            if all(obs[agent]['action_mask'] == 1 for agent in uav_ids):
-                score = actor(obs)
-                dist = Categorical(score)
-                action = dist.sample()
-                for i, agent in enumerate(uav_ids):
-                    action_dict[agent] = int(action[i].item())
-
-            next_obs, rewards, terminations, truncation, info = env.step(action_dict, training=True)
-
-            # If a UAV action was taken, update actor and critic using A2C
-            if any(agent in action_dict for agent in uav_ids):
-                reward = rewards['uav_0_0']
-                value = critic(obs)
-                next_value = critic(next_obs)
-                done_flag = all(terminations[agent] for agent in uav_ids)
-                td_target = reward + gamma * next_value * (1 - done_flag)
-                advantage = td_target - value
-
-                critic_loss = F.mse_loss(value, td_target.detach())
-                optimizer_critic.zero_grad()
-                critic_loss.backward()
-                optimizer_critic.step()
-
-                log_prob = dist.log_prob(action)
-                actor_loss = -log_prob * advantage.detach()
-                optimizer_actor.zero_grad()
-                actor_loss.backward()
-                optimizer_actor.step()
-
-                stats['Actor Loss'].append(actor_loss.item())
-                stats['Critic Loss'].append(critic_loss.item())
-
-            episode_return += sum(rewards.get(agent, 0) for agent in uav_ids)
-            env_termination = terminations
-            obs = next_obs
-
-        stats['Returns'].append(episode_return)
-        stats['Time cost'].append(info['cur_time_step'])
-        # print(f"Episode {episode + 1}/{num_episodes} | Return: {episode_return}")
-
-    torch.save(actor.state_dict(), f"uav_actor_{datetime.datetime.now()}.pth")
-    torch.save(critic.state_dict(), f"uav_critic_{datetime.datetime.now()}.pth")
-
-    # draw episode-return graph and save
-    plt.plot(stats['Returns'])
-    plt.xlabel('Episode')
-    plt.ylabel('Return')
-    plt.title('Episode-Return Graph')
-    plt.savefig(f'episode_return_graph_{datetime.datetime.now()}.png')
-
-    # draw episode-timecost graph and save
-    plt.figure()
-    plt.plot(stats['Time cost'])
-    plt.xlabel('Episode')
-    plt.ylabel('Time cost')
-    plt.title('Episode-Time Cost Graph')
-    plt.savefig(f'episode_timecost_graph_{datetime.datetime.now()}.png')
-
-    env.close()
+        # score = F.softmax(score, dim=-1)  # softmax is added in the Categorical distribution
+        return score
 
 
 if __name__ == "__main__":
-    training_config = {
+    from env.VecEnv import SubprocVectorizedMultiAgentEnv
+    from util.make_env import make_env
+
+    config = {
         "uav_num": 1,
-        "uav_velocity": 5,
-        "truck_velocity": 3,
-        "uav_power": 40,
-        "power_coefficient": 0.3,
-        "num_customer": 300,
-        "space_width": 30,
-        "space_height": 25,
-        "cluster_number": 7,
-        "max_step": 10_000,
-        "render_mode": "rgb_array",
-    }
-    testing_config = {
-        "uav_num": 1,
+        "group_num": 1,
+        "uav_velocity": 3,
+        "max_step": 1000,
         "num_customer": 10,
+        "space_width": 10,
+        "space_height": 10,
+        "cluster_number": 2,
+        "render_mode": "rgb_array"
     }
-    train(training_config, num_episodes=100)
+    num_envs = 2
+    envs = [make_env(config) for _ in range(num_envs)]
+    parallel_env = SubprocVectorizedMultiAgentEnv(envs)
+    obs, rewards, dones, _, _ = parallel_env.init()
+    batch_ = build_batch(obs)
+    tensor = buildStateTensor(batch_, device=device)
+
+    actor = UAVActor(feature_dim=tensor.shape[2], embed_dim=128, attention_nhead=4, attention_num_layers=2,
+                     lstm_num_layers=2, lstm_hidden_dim=128).to(device)
+
+    score = actor(obs)
+    # score = F.softmax(score)
+    dist = torch.distributions.Categorical(logits=score)
+    action = dist.sample()
+    logits = dist.logits
+    neg_log_prob = - dist.log_prob(action)
+
+    print(score)
+    print(action)
+    print(logits)
+    print(neg_log_prob)
+
+    # encoder = Encoder(feature_dim=tensor.shape[2], embed_dim=128, nhead=4, num_layers=2).to(device)
+    # latest = torch.argmax(batch_["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value, dim=1)
+    # x = encoder(batch_)
+    # x_mean = x.mean(dim=1)
+    # latest_embed = x[torch.arange(x.size(0)), latest, :]
+    # #
+    # decoder = Decoder(embed_dim=128, num_layers=3, hidden_dim=128).to(device)
+    # score = decoder(latest_embed, x_mean, batch_, latest)
+
+    # status = torch.cat([batch["power"].unsqueeze(-1), batch["capacity"].unsqueeze(-1), batch["travel_distance"].unsqueeze(-1)], dim=-1).to(device)
+    # nodes = torch.cat([batch["nodes"], batch["truck"].unsqueeze(1)], dim=1).to(device)
+    # dist_vec = torch.cdist(nodes, nodes, p=2)
+    # dist_vec = dist_vec[torch.arange(dist_vec.size(0)), latest, :]
+
