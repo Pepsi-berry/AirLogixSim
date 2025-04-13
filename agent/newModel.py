@@ -155,7 +155,7 @@ class Decoder(nn.Module):
         return score
 
 
-class UAVActor(nn.Module):
+class OldUAVActor(nn.Module):
     def __init__(self,
                  feature_dim=3,
                  embed_dim=128,
@@ -163,16 +163,22 @@ class UAVActor(nn.Module):
                  attention_num_layers=2,
                  lstm_num_layers=2,
                  lstm_hidden_dim=128,
+                 mask_all=True
                  ):
-        super(UAVActor, self).__init__()
+        super(OldUAVActor, self).__init__()
         self.encoder = Encoder(feature_dim=feature_dim, embed_dim=embed_dim, nhead=attention_nhead,
                                num_layers=attention_num_layers)
         self.decoder = Decoder(embed_dim, lstm_num_layers, lstm_hidden_dim)
         self.scale = math.sqrt(embed_dim)
+        self.mask_all = mask_all
 
     def forward(self, obs):
         batch = build_batch(obs)
-        latest = torch.argmax(batch["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value, dim=1)
+        # latest = torch.argmax(batch["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value, dim=1)
+        latest = torch.argmax(
+            (batch["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value).long(),
+            dim=1
+        )
         x = self.encoder(batch)
         x_mean = x.mean(dim=1)
         # print(x_mean.shape)  # (batch, candidate_embed_dim)
@@ -180,12 +186,121 @@ class UAVActor(nn.Module):
         score = self.decoder(last_target, x_mean, batch, latest) / self.scale
 
         # masked out infeasible actions
-        # infeasible = torch.logical_and(batch["choice_mask"] == UAVActionRet.CLOSED_NODE.value,
-        #                                batch["choice_mask"] == UAVActionRet.SAME_TARGET.value)
-        infeasible = torch.Tensor(batch['choice_mask'] != UAVActionRet.FEASIBLE.value).to(device)
+        if self.mask_all:
+            infeasible = torch.Tensor(batch['choice_mask'] != UAVActionRet.FEASIBLE.value).to(device)
+        else:
+            infeasible = torch.logical_and(torch.Tensor(batch["choice_mask"] == UAVActionRet.CLOSED_NODE.value),
+                                           torch.Tensor(batch["choice_mask"] == UAVActionRet.SAME_TARGET.value)).to(device)
         score = score.masked_fill(infeasible, -1e9)
         # score = F.softmax(score, dim=-1)  # softmax is added in the Categorical distribution
         return score
+
+
+class ImprovedDecoder(nn.Module):
+    """
+    改进版的 Decoder 模块：基于编码器输出、代理状态信息和附加约束条件生成动作打分。
+
+    主要思路：
+     - 通过一个全连接层将代理状态（例如 power、capacity、travel_distance）映射到与 embedding 相同的空间。
+     - 利用多头注意力机制，将代理状态作为查询（query），候选点的 embedding 作为键（key）和值（value），计算注意力输出。
+     - 将注意力输出与候选点的原始 embedding 融合后，通过前馈神经网络计算每个候选动作（例如候选点）的打分（logits）。
+
+    Args:
+        embed_dim (int): embedding 的维度（默认 128）。
+        num_heads (int): 多头注意力的头数（默认 4）。
+        ff_hidden_dim (int): 前馈网络的隐藏层维度（默认 256）。
+        dropout (float): dropout 概率（默认 0.1）。
+    """
+
+    def __init__(self, embed_dim=128, num_heads=4, ff_hidden_dim=256, dropout=0.1):
+        super(ImprovedDecoder, self).__init__()
+        # 将代理状态（3 维：power, capacity, travel_distance）投影到 embed_dim 空间
+        self.state_proj = nn.Linear(3, embed_dim)
+        # 进一步转换状态向量，为后续作为注意力查询作准备
+        self.query_proj = nn.Linear(embed_dim, embed_dim)
+        # 多头注意力层：查询来自代理状态，键和值来自 encoder 输出
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=dropout, batch_first=True)
+        # 前馈网络，用于将融合后的 embedding 生成候选动作对应的打分（logit）
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_dim, ff_hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_hidden_dim, 1)
+        )
+
+    def forward(self, encoder_outputs, batch, agent_state_extra=None):
+        """
+        Args:
+            encoder_outputs (Tensor): 编码器的输出，形状 (batch, num_candidates, embed_dim)。
+            batch (dict): 包含代理信息的字典，要求至少包含下列键：
+                - "power": Tensor, 形状 (batch,)（代理剩余电量）
+                - "capacity": Tensor, 形状 (batch,)（代理载重或任务容量）
+                - "travel_distance": Tensor, 形状 (batch,)（代理已行驶距离或耗能指标）
+            agent_state_extra (Tensor, optional): 额外的代理状态信息，形状 (batch, embed_dim)。
+                用于进一步融合更多约束条件，默认不使用（None）。
+        Returns:
+            logits (Tensor): 每个候选动作的打分，形状 (batch, num_candidates)。
+            attn_weights (Tensor): 多头注意力层输出的注意力权重。
+        """
+        # 将代理状态信息（power, capacity, travel_distance）拼接后投影到 embedding 空间
+        state_features = torch.stack([batch["power"], batch["capacity"], batch["travel_distance"]], dim=1).to(
+            encoder_outputs.device)
+        state_embed = self.state_proj(state_features)  # shape: (batch, embed_dim)
+        query = self.query_proj(state_embed).unsqueeze(1)  # shape: (batch, 1, embed_dim)
+
+        # 如果有额外的代理状态信息，可以将其简单融合进查询向量中
+        if agent_state_extra is not None:
+            query = query + agent_state_extra.unsqueeze(1)
+
+        # 利用多头注意力计算：查询为代理状态，键和值为候选 embedding
+        attn_output, attn_weights = self.multihead_attn(query, encoder_outputs, encoder_outputs)
+        # 扩展 attention 输出，使其与候选 embedding 维度匹配
+        batch_size, num_candidates, _ = encoder_outputs.shape
+        attn_expanded = attn_output.expand(-1, num_candidates, -1)  # (batch, num_candidates, embed_dim)
+        # 融合候选 embedding 和注意力输出（例如简单相加，可试验其他融合策略）
+        combined = encoder_outputs + attn_expanded
+        # 通过前馈网络产生每个候选动作的打分
+        logits = self.feed_forward(combined).squeeze(-1)  # (batch, num_candidates)
+        return logits, attn_weights
+
+
+class UAVActor(nn.Module):
+    """
+    UAVActor 模型：
+    - 首先利用 Encoder 对候选点进行编码，
+    - 然后通过 ImprovedDecoder 利用代理状态信息计算各候选动作的打分，
+    - 最后将得分除以一个缩放系数并对不可行动作进行 mask。
+    """
+    def __init__(self, feature_dim=3, embed_dim=128, num_heads=4, ff_hidden_dim=256, mask_all=True):
+        super(UAVActor, self).__init__()
+        self.encoder = Encoder(feature_dim=feature_dim, embed_dim=embed_dim, nhead=num_heads, num_layers=2)
+        self.decoder = ImprovedDecoder(embed_dim=embed_dim, num_heads=num_heads, ff_hidden_dim=ff_hidden_dim)
+        self.scale = math.sqrt(embed_dim)
+        self.mask_all = mask_all
+
+    def forward(self, obs):
+        """
+        Args:
+            obs: 环境观察数据，类型与 build_batch 函数定义相同。
+        Returns:
+            logits (Tensor): 每个候选动作的打分，形状 (batch, num_candidates)。
+        """
+        batch = build_batch(obs)
+        # 对候选状态进行编码
+        x = self.encoder(batch)  # (batch, num_candidates, embed_dim)
+        # 利用改进版 decoder 得到候选动作得分
+        logits, attn = self.decoder(x, batch)
+        # 缩放打分
+        logits = logits / self.scale
+        # 根据环境中 choice_mask 对不可行动作进行 mask
+        if self.mask_all:
+            infeasible = torch.Tensor(batch["choice_mask"] != UAVActionRet.FEASIBLE.value).to(x.device)
+        else:
+            # 如有其他 mask 逻辑，可在此进行扩展
+            infeasible = torch.Tensor(batch["choice_mask"] != UAVActionRet.FEASIBLE.value).to(x.device)
+        logits = logits.masked_fill(infeasible, -1e9)
+        return logits
+
 
 
 if __name__ == "__main__":
@@ -220,12 +335,18 @@ if __name__ == "__main__":
     logits = dist.logits
     neg_log_prob = - dist.log_prob(action)
 
-    print(score)
-    print(action)
-    print(logits)
-    print(neg_log_prob)
+    # print(score)
+    # print(action)
+    # print(logits)
+    # print(neg_log_prob)
 
     # encoder = Encoder(feature_dim=tensor.shape[2], embed_dim=128, nhead=4, num_layers=2).to(device)
+    latest = torch.argmax(
+        (batch_["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value).long(),
+        dim=1
+    )
+    print(batch_["choice_mask"])
+    print(latest)
     # latest = torch.argmax(batch_["choice_mask"].clone().to(device) == UAVActionRet.SAME_TARGET.value, dim=1)
     # x = encoder(batch_)
     # x_mean = x.mean(dim=1)

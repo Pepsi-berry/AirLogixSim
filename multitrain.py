@@ -21,10 +21,13 @@ device = get_device()
 
 class TrainingModel:
     def __init__(self, n_updates, lr=7e-4, alpha=0.99, epsilon=1e-5, ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5):
-        self.actor = UAVActor(embed_dim=128,
-                              attention_nhead=8,
-                              attention_num_layers=3,
-                              lstm_num_layers=4).to(device)
+        # self.actor = UAVActor(embed_dim=128,
+        #                       attention_nhead=8,
+        #                       attention_num_layers=3,
+        #                       lstm_num_layers=4,
+        #                       mask_all=True).to(device)
+        self.actor = UAVActor().to(device)
+
         self.critic = LSTMCritic().to(device)
         self.actor.train()
         self.critic.train()
@@ -64,15 +67,13 @@ class TrainingModel:
         policy_latent = self.actor(obs)
         dist = Categorical(logits=policy_latent)
 
-        neglogpac = -dist.log_prob(actions)
-
         entropy = torch.mean(dist.entropy())
 
         vpred = self.critic(obs)
 
         # Compute losses
         vf_loss = F.mse_loss(vpred, rewards.unsqueeze(1))
-        pg_loss = torch.mean(advantages * neglogpac)
+        pg_loss = -torch.mean(advantages.detach() * dist.log_prob(actions))
 
         loss = pg_loss - entropy * self.ent_coef + vf_loss * self.vf_coef
 
@@ -88,7 +89,7 @@ class TrainingModel:
         return pg_loss.item(), vf_loss.item(), entropy.item()
 
     @torch.no_grad()
-    def eval(self, config, seed=42):
+    def eval(self, config, seed):
         self.actor.eval()
         env = DeliveryEnv(config)
         obs, info = env.reset(seed=seed)
@@ -116,6 +117,7 @@ class TrainingModel:
 def train(
         config,
         n_updates,
+        seed=42,
         num_envs=4,
         nsteps=5,
         lr=7e-4,
@@ -147,7 +149,7 @@ def train(
     """
 
     envs = [make_env(config) for _ in range(num_envs)]
-    vec_env = SubprocVectorizedMultiAgentEnv(envs)
+    vec_env = SubprocVectorizedMultiAgentEnv(envs, seed=seed)
     model = TrainingModel(n_updates=n_updates, lr=lr, alpha=alpha, epsilon=epsilon, ent_coef=ent_coef,
                           vf_coef=vf_coef, max_grad_norm=max_grad_norm)
     runner = Runner(vec_env, model, nsteps=nsteps, gamma=gamma)
@@ -164,16 +166,17 @@ def train(
         # Train the model
         pg_loss, vf_loss, entropy = model.train(obs, rewards, actions, values)
 
+        stats['Actor Loss'].append(pg_loss)
+        stats['Critic Loss'].append(vf_loss)
+        stats['Entropy'].append(entropy)
+        stats['Returns'].append(rewards.mean())
+
         if update % log_interval == 0 or update == 1:
             # eval actor
-            time_cost = model.eval(config)
+            time_cost = model.eval(config, seed=seed)
+            stats['Time Cost'].append(time_cost)
 
             # Log statistics
-            stats['Time Cost'].append(time_cost)
-            stats['Actor Loss'].append(pg_loss)
-            stats['Critic Loss'].append(vf_loss)
-            stats['Entropy'].append(entropy)
-            stats['Returns'].append(rewards.mean())
             print(f"Update {update}/{n_updates} | "
                   f"Actor Loss: {pg_loss: .4f} | Critic Loss: {vf_loss: .4f} | Entropy: {entropy: .4f} | "
                   f"Returns: {rewards.mean(): .4f} | Time Cost: {time_cost}")
@@ -212,14 +215,24 @@ if __name__ == "__main__":
         "uav_num": 1,
         "group_num": 1,
         "uav_velocity": 3,
-        "max_step": 1000,
-        "num_customer": 10,
-        "space_width": 10,
+        "uav_power": 20,
+        "power_coefficient": 0.3,
+        "truck_velocity": 100,
+        "max_step": 360,
+        "num_customer": 100,
+        "space_width": 20,
         "space_height": 10,
-        "cluster_number": 2,
+        "cluster_number": 5,
         "render_mode": "rgb_array"
     }
     num_envs_ = 4
-    n_updates_ = 5000
+    n_updates_ = 8000
     nsteps_ = 5
-    train(config_, n_updates_, num_envs_, nsteps_, save_path='run')
+    train(
+        config=config_,
+        seed=42,
+        n_updates=n_updates_,
+        num_envs=num_envs_,
+        nsteps=nsteps_,
+        save_path='run'
+    )
