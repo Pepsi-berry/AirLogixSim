@@ -116,23 +116,25 @@ class DeliveryEnv(ParallelEnv):
         self.means = config.get("means", [0, 0])
         self.std_dev = config.get("std_devs", [1, 1])
 
-        self.reward_dict = {
-            "every_time_step": -5,
-            "uav_out_of_power": -100,
-            "uav_out_of_capacity": -100,
-            "uav_out_of_cluster": -10,
-            "uav_out_of_power_return": -100,
-            "uav_closed_nodes": -10,
-            "uav_current_target": -10,
-            # "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10+distance*0.1-(self.uav_capacity-load)*0.2,
-            # "uav_charging": lambda power: 5 if power < self.low_power_threshold * self.uav_power else -10,
-            "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10 - (self.uav_capacity - load) * 0.1,
-            "uav_charging": lambda power: 10 if power < self.low_power_threshold * self.uav_power else -10,
-            "mission_completed": 0,
-            "truck_current_target": -1,
-            "truck_serve_customer": 1,
-            "truck_illegal_return": -10
-        }
+        # self.reward_dict = {
+        #     "every_time_step": -5,
+        #     "uav_out_of_power": -100,
+        #     "uav_out_of_capacity": -100,
+        #     "uav_out_of_cluster": -10,
+        #     "uav_out_of_power_return": -100,
+        #     "uav_closed_nodes": -10,
+        #     "uav_current_target": -10,
+        #     # "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10+distance*0.1-(self.uav_capacity-load)*0.2,
+        #     # "uav_charging": lambda power: 5 if power < self.low_power_threshold * self.uav_power else -10,
+        #     "uav_round_trip": lambda distance, load: 0 if distance == 0 else 10 - (self.uav_capacity - load) * 0.1,
+        #     "uav_charging": lambda power: 10 if power < self.low_power_threshold * self.uav_power else -10,
+        #     "mission_completed": 0,
+        #     "truck_current_target": -1,
+        #     "truck_serve_customer": 1,
+        #     "truck_illegal_return": -10
+        # }
+
+
 
         # agent definition
         self.possible_agents = ([f"uav_{i}_{j}" for j in range(self.uav_num) for i in range(self.group_num)]
@@ -160,6 +162,25 @@ class DeliveryEnv(ParallelEnv):
         self.infos = None
         self.kmeans = None
         self.group_assigned = None  # group -> k-means cluster mapping
+        self.delivery_per_trip = None  # count number of nodes delivered by uav in one trip to encourage multi-visit.
+
+        self.reward_dict = {
+            "every_time_step": -0.1,
+            "uav_charging": lambda power: 0 if power < self.low_power_threshold * self.uav_power else 0,
+            "uav_deliver_node": 0,
+            "mission_completed": (lambda: max(self.max_step - self.time_step, 0))(),
+            "uav_trip_delivery_bonus": lambda uav_name: 5 * (self.delivery_per_trip[uav_name] - 1),
+            "uav_round_trip": lambda distance, load: 0,
+            "uav_out_of_power": -10,
+            "uav_out_of_capacity": -10,
+            "uav_out_of_cluster": -10,
+            "uav_out_of_power_return": -10,
+            "uav_closed_nodes": -5,
+            "uav_current_target": 0,
+            "truck_current_target": 0,
+            "truck_serve_customer": 0,
+            "truck_illegal_return": 0
+        }
 
         # define the observation space and action space for each agent
         self.observation_spaces = {}
@@ -257,6 +278,7 @@ class DeliveryEnv(ParallelEnv):
                              agent in self.possible_agents}
         self.agent_target = {agent: None for agent in self.possible_agents}
         self.truck_loaded_uav = {}
+        self.delivery_per_trip = {agent: 0 for agent in self.possible_agents if agent.startswith("uav")}
         for agent in self.possible_agents:
             if agent.startswith("truck"):
                 group_num, agent_num = self._get_agent_group(agent)
@@ -341,14 +363,17 @@ class DeliveryEnv(ParallelEnv):
                 self.agent_target[agent] = f"truck_{group_num}_{act - self.num_customer}"
             else:
                 raise ValueError(f"Unknown action: {act}, agent: {agent}")
-
+        first_it = True
+        self.time_step += 1
+        self.infos["cur_time_step"] = self.time_step
         while all(not self._get_action_mask(agent) or self.terminations[agent] for agent in self.possible_agents):
-            self.time_step += 1
+            self.time_step += 1 if not first_it else 0
+            first_it = False
             self.infos["cur_time_step"] = self.time_step
             if self.time_step > self.max_step:
                 self.truncation = True
                 observations = self._get_observations()
-                rewards = {agent: 0 for agent in self.possible_agents}
+                rewards = {agent: -100 for agent in self.possible_agents}
                 terminations = {agent: True for agent in self.possible_agents}
                 return observations, rewards, terminations, self.truncation, self.infos
 
@@ -394,6 +419,8 @@ class DeliveryEnv(ParallelEnv):
                         rewards[agent] += self.reward_dict["uav_round_trip"](self.cur_uav_travel_distance[agent],
                                                                              self.cur_uav_capacity[agent])
                         rewards[agent] += self.reward_dict["uav_charging"](self.cur_uav_power[agent])
+                        rewards[agent] += self.reward_dict["uav_trip_delivery_bonus"](agent)
+                        self.delivery_per_trip[agent] = 0
                         self.cur_uav_travel_distance[agent] = 0
                         self.cur_uav_power[agent] = self.uav_power
                         self.cur_uav_capacity[agent] = self.uav_capacity
@@ -408,6 +435,8 @@ class DeliveryEnv(ParallelEnv):
                         self.agent_status[agent] = UAVState.LANDING.value
                         self.node_mask[target] = PackageState.DELIVERED.value
                         self.agent_target[agent] = None
+                        self.delivery_per_trip[agent] += 1
+                        rewards[agent] += self.reward_dict["uav_deliver_node"]
                     else:
                         self.agent_coordinates[agent] = (
                             agent_coordinate[0] + x_distance * self.uav_velocity / distance,

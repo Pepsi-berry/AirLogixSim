@@ -12,6 +12,7 @@ class CloudpickleWrapper:
     利用 cloudpickle 对环境构造函数进行包装，
     以解决 multiprocessing 默认 pickle 无法序列化局部函数的问题
     """
+
     def __init__(self, x):
         self.x = x
 
@@ -22,7 +23,7 @@ class CloudpickleWrapper:
         self.x = pickle.loads(ob)
 
 
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(remote, parent_remote, env_fn_wrapper, seed):
     """
     Subprocess worker func. Receive cmd and data to execute init/step/close operation.
     :param remote: pipe to communicate with parent process
@@ -32,7 +33,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()  # 关闭不必要的 pipe 端
     env = env_fn_wrapper.x()
 
-    obs, info = env.reset(seed=None, options={'redistribute': False})
+    obs, info = env.reset(seed=seed, options={'redistribute': False})
     route = plan_truck_route(obs["truck_0_0"]["nodes"].tolist(),
                              list(info['center_node'].values()), env.warehouse)
     route[1].append(env.num_customer)
@@ -42,7 +43,8 @@ def worker(remote, parent_remote, env_fn_wrapper):
         while True:
             cmd, data = remote.recv()
             if cmd == "init":
-                observation, reward, termination, truncation, info = env.step({"truck_0_0": truck_route.pop(0)}, training=True)
+                observation, reward, termination, truncation, info = env.step({"truck_0_0": truck_route.pop(0)},
+                                                                              training=True)
                 # print("truck move")
                 remote.send((observation["uav_0_0"], reward["uav_0_0"], all(termination.values()), truncation, info))
             elif cmd == "step":
@@ -52,12 +54,13 @@ def worker(remote, parent_remote, env_fn_wrapper):
                 # when truck moves, reward of uav is 0, so previous reward is sent to uav
                 # execute this in order to remove effects of trucks on uav
                 if observation["truck_0_0"]["action_mask"] == 1 and len(truck_route) > 0:
-                    observation, _, termination, truncation, info = env.step({"truck_0_0": truck_route.pop(0)}, training=True)
+                    observation, _, termination, truncation, info = env.step({"truck_0_0": truck_route.pop(0)},
+                                                                             training=True)
                     # print("truck move")
                 # if an env is done, reset and return new observation
                 if all(termination.values()):
                     # print("done")
-                    env.reset(seed=None, options={'redistribute': False})
+                    env.reset(seed=seed, options={'redistribute': False})
                     truck_route = copy(route)
                     observation, _, _, _, _ = env.step({"truck_0_0": truck_route.pop(0)}, training=True)
                     # print("truck move")
@@ -78,7 +81,8 @@ class SubprocVectorizedMultiAgentEnv:
     每个子进程运行一个 DeliveryEnv 实例
     使用 dict 存储 index -> remote, process, 等，方便单独操作
     """
-    def __init__(self, env_fns):
+
+    def __init__(self, env_fns, seed: int = 42):
         """
         :param env_fns: 一个列表，每个元素为创建环境实例的无参函数
         """
@@ -86,11 +90,12 @@ class SubprocVectorizedMultiAgentEnv:
         self.remotes = {}
         self.work_remotes = {}
         self.processes = {}
+        self.seed = seed
         for i, env_fn in enumerate(env_fns):
             parent_remote, child_remote = mp.Pipe()
             self.remotes[i] = parent_remote
             self.work_remotes[i] = child_remote
-            p = mp.Process(target=worker, args=(child_remote, parent_remote, CloudpickleWrapper(env_fn)))
+            p = mp.Process(target=worker, args=(child_remote, parent_remote, CloudpickleWrapper(env_fn), seed))
             p.daemon = True  # 主进程结束时子进程自动结束
             p.start()
             self.processes[i] = p
@@ -165,6 +170,7 @@ if __name__ == '__main__':
     parallel_env = SubprocVectorizedMultiAgentEnv(envs)
     obs, rewards, dones, _, _ = parallel_env.init()
 
+
     def num2status(choice_mask):
         ret = []
         for x in choice_mask:
@@ -179,6 +185,7 @@ if __name__ == '__main__':
             else:
                 ret.append("illegal")
         return ret
+
 
     for _ in range(40):
         for x in range(num_envs):
