@@ -40,7 +40,7 @@ class Runner:
             mb_obs.append(copy(self.obs))
             mb_actions.append(actions.cpu())
             mb_values.append(values.cpu())
-            mb_dones.append(self.dones)  # (num_env, 1)
+            mb_dones.append(copy(self.dones))  # (num_env, 1)
 
             self.obs[:], rewards, self.dones[:], _, infos = self.env.step(actions.tolist())
             for info in infos:
