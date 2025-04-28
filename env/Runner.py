@@ -30,7 +30,7 @@ class Runner:
         :return: obs, rewards, actions, values
         """
         mb_obs, mb_rewards, mb_dones, mb_actions, mb_values = [], [], [], [], []  # (num_env, 1)
-
+        ep_info = []
         for _ in range(self.nsteps):
             scores = self.model.actor(self.obs)   # (num_env, num_actions)
             values = self.model.critic(self.obs)  # (num_env, 1)
@@ -42,7 +42,10 @@ class Runner:
             mb_values.append(values.cpu())
             mb_dones.append(self.dones)  # (num_env, 1)
 
-            self.obs[:], rewards, self.dones[:], _, _ = self.env.step(actions.tolist())
+            self.obs[:], rewards, self.dones[:], _, infos = self.env.step(actions.tolist())
+            for info in infos:
+                if info.get("end", False):
+                    ep_info.append(info.get("r")["uav_0_0"])
             mb_rewards.append(rewards)
         mb_dones.append(self.dones)
 
@@ -68,7 +71,7 @@ class Runner:
 
         mb_rewards = mb_rewards.flatten()
         mb_values = mb_values.flatten()
-        return mb_obs, mb_rewards, mb_actions, mb_values
+        return mb_obs, mb_rewards, mb_actions, mb_values, ep_info
 
 
 def discount_with_dones(rewards, dones, gamma):
