@@ -35,7 +35,7 @@ class UAVCritics(nn.Module):
         linear_proj = self.linear_proj(state_tensor)
         encoder_out = self.encoder(linear_proj)
         decoder_out = self.decoder(encoder_out, memory=encoder_out)
-        return decoder_out.mean()
+        return decoder_out.mean(dim=(1,2), keepdim=True).squeeze(2)
 
 
 class LSTMCritic(nn.Module):
@@ -297,7 +297,8 @@ class UAVActor(nn.Module):
             infeasible = torch.Tensor(batch["choice_mask"] != UAVActionRet.FEASIBLE.value).to(x.device)
         else:
             # 如有其他 mask 逻辑，可在此进行扩展
-            infeasible = torch.Tensor(batch["choice_mask"] != UAVActionRet.FEASIBLE.value).to(x.device)
+            infeasible = torch.logical_and(torch.Tensor(batch["choice_mask"] == UAVActionRet.CLOSED_NODE.value),
+                                           torch.Tensor(batch["choice_mask"] == UAVActionRet.SAME_TARGET.value)).to(x.device)
         logits = logits.masked_fill(infeasible, -1e9)
         return logits
 
@@ -325,8 +326,15 @@ if __name__ == "__main__":
     batch_ = build_batch(obs)
     tensor = buildStateTensor(batch_, device=device)
 
-    actor = UAVActor(feature_dim=tensor.shape[2], embed_dim=128, attention_nhead=4, attention_num_layers=2,
-                     lstm_num_layers=2, lstm_hidden_dim=128).to(device)
+    lstm_critic = LSTMCritic(input_dim=tensor.shape[2], hidden_dim=128).to(device)
+    critic = UAVCritics(feature_dim=tensor.shape[2], embed_dim=128).to(device)
+
+    # actor = UAVActor(feature_dim=tensor.shape[2], embed_dim=128, attention_nhead=4, attention_num_layers=2,
+    #                  lstm_num_layers=2, lstm_hidden_dim=128).to(device)
+
+    print(lstm_critic(obs))
+    print(critic(obs))
+    exit()
 
     score = actor(obs)
     # score = F.softmax(score)
