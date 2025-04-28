@@ -7,7 +7,7 @@ import datetime
 import matplotlib.pyplot as plt
 
 from env.MultiAgentEnv import DeliveryEnv
-from agent.newModel import UAVActor, LSTMCritic
+from agent.uav import UAVActor, LSTMCritic
 from agent.truck import plan_truck_route
 from tqdm import tqdm
 import os
