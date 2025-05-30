@@ -9,6 +9,8 @@ from tqdm import tqdm
 from env.MultiAgentEnv import DeliveryEnv, UAVActionRet
 from run_model import run
 from util.vrp_solver import solve_vrp, calc_matrix
+import json
+import datetime
 
 
 class _Baseline(ABC):
@@ -42,7 +44,7 @@ class SingleVisitBaseline(_Baseline):
             action = {}
             for x in range(env.group_num):
                 route = routes[x]
-                if obs[f"truck_{x}_0"]["action_mask"] == 1:
+                if obs[f"truck_{x}_0"]["action_mask"] == 1 and len(route) > 0:
                     action[f"truck_{x}_0"] = route.pop(0) if len(route) > 0 else env.num_customer
                 else:
                     for y in range(env.uav_num):
@@ -76,7 +78,7 @@ class RandomBaseline(_Baseline):
             action = {}
             for x in range(env.group_num):
                 route = routes[x]
-                if obs[f"truck_{x}_0"]["action_mask"] == 1:
+                if obs[f"truck_{x}_0"]["action_mask"] == 1 and len(route) > 0:
                     action[f"truck_{x}_0"] = route.pop(0) if len(route) > 0 else env.num_customer
                 # elif len(route) == 0:
                 #     continue
@@ -115,7 +117,7 @@ class GreedyBaseline(_Baseline):
             action = {}
             for x in range(env.group_num):
                 route = routes[x]
-                if obs[f"truck_{x}_0"]["action_mask"] == 1:
+                if obs[f"truck_{x}_0"]["action_mask"] == 1 and len(route) > 0:
                     action[f"truck_{x}_0"] = route.pop(0) if len(route) > 0 else env.num_customer
                 # elif len(route) == 0:
                 #     continue
@@ -361,7 +363,7 @@ def vrp_eval_baseline(env: DeliveryEnv, truck: int, baseline: List[str] | str):
     :return: time consumption
     """
     seed = random.randint(1, 2**31-1)
-    print(seed)
+    # print(seed)
     # 1118035048
     # 1948869753
     obs, info = env.reset(seed=seed, options={"redistribute": True})
@@ -382,7 +384,7 @@ def vrp_eval_baseline(env: DeliveryEnv, truck: int, baseline: List[str] | str):
     # print(routes)
 
     if isinstance(baseline, str) and baseline == "all":
-        baseline = ["random", "greedy", "tsp", "clarke_wright"]
+        baseline = ["random", "greedy", "tsp", "clarke_wright", "single_visit"]
     elif isinstance(baseline, str):
         baseline = [baseline]
 
@@ -405,8 +407,8 @@ def vrp_eval_baseline(env: DeliveryEnv, truck: int, baseline: List[str] | str):
             else:
                 raise ValueError(f"Unknown baseline: {b}")
             count+=1
-        if count > 3:
-            raise ValueError(f"Baseline {b} took too long to converge.")
+            if count > 3:
+                raise ValueError(f"Baseline {b} took too long to converge.")
     return ret
 
 
@@ -420,11 +422,25 @@ if __name__ == "__main__":
         #     "uav_power": 20,
         #     "power_coefficient": 0.2,
         #     "max_step": 400,
+        #     "num_customer": 20,
+        #     "space_width": 5,
+        #     "space_height": 5,
+        #     "cluster_number": 2,
+        #     "render_mode": "human"
+        # },
+        # {
+        #     "group_num": 2,
+        #     "uav_num": 2,
+        #     "uav_velocity": 3,
+        #     "truck_velocity": 1,
+        #     "uav_power": 20,
+        #     "power_coefficient": 0.2,
+        #     "max_step": 400,
         #     "num_customer": 100,
         #     "space_width": 15,
         #     "space_height": 10,
         #     "cluster_number": 5,
-        #     "render_mode": "rgb_array"
+        #     "render_mode": "human"
         # },
         # {
         #     "group_num": 2,
@@ -459,32 +475,27 @@ if __name__ == "__main__":
     num = 100
     exp_data = []
     for i, c in enumerate(config):
-        stat = {"random": 0, "greedy": 0, "tsp": 0, "clarke_wright": 0, "model": 0}
+        stat = {"random": [], "greedy": [], "tsp": [], "clarke_wright": [], "single_visit": [], "model_best": [], "model_last": []}
         env = DeliveryEnv(c)
         for _ in tqdm(range(num)):
             ret = vrp_eval_baseline(env, truck=2, baseline="all")
-            stat["random"] += ret["random"]
-            stat["greedy"] += ret["greedy"]
-            stat["tsp"] += ret["tsp"]
-            stat["clarke_wright"] += ret["clarke_wright"]
+            stat["random"].append(ret["random"])
+            stat["greedy"].append(ret["greedy"])
+            stat["tsp"].append(ret["tsp"])
+            stat["clarke_wright"].append(ret["clarke_wright"])
+            stat["single_visit"].append(ret["single_visit"])
 
-            ret["model"] = math.inf
-            count = 0
-            ret["model"] = min(run(env, "run/20250423-223838/best.pt"),run(env, "run/20250423-223838/last.pt"))
-            while ret["model"] > env.max_step:
-                # print("Evaluating best model...")
-                ret["model"] = min(run(env, "run/20250423-223838/best.pt"),run(env, "run/20250423-223838/last.pt"))
-                count += 1
-                if count > 3:
-                    raise ValueError("Model took too long to converge.")
-            stat["model"] += ret["model"]
+            stat["model_best"].append(run(env, "run/20250423-223838/best.pt"))
+            stat["model_last"].append(run(env, "run/20250423-223838/last.pt"))
+
+            means = {k: np.mean(v) for k, v in stat.items()}
+            stds = {k: np.std(v) for k, v in stat.items()}
+
+        with open(f'exp/{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.json', 'w') as f:
+            json.dump({
+                "config": c,
+                "mean": means,
+                "std": stds,
+                "stat": stat,
+            }, f, indent=4)
         env.close()
-        for k in stat.keys():
-            stat[k] /= num
-        exp_data.append(stat)
-
-        with open(f'exp/config_{i+1}.txt', 'w') as f:
-            f.write(f"Config {i+1}: {c}\n")
-            f.write(f"Results: {stat}\n")
-            f.write("\n")
-    exit()
