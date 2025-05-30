@@ -8,3 +8,5 @@ torch
 tqdm
 matplotlib
 cloudpickle
+toml
+ortools

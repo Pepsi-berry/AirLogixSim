@@ -3,6 +3,7 @@ from copy import copy
 from enum import Enum
 import re
 import os
+import math
 
 import numpy as np
 from gymnasium.spaces import Discrete, Dict, MultiDiscrete, Box, Tuple
@@ -88,7 +89,7 @@ class DeliveryEnv(ParallelEnv):
 
         # visualization
         self.screen = None
-        self.element_size = 15
+        self.element_size = 20
         self.screen_width = None
         self.screen_height = None
         self.material_library = {}
@@ -134,8 +135,6 @@ class DeliveryEnv(ParallelEnv):
         #     "truck_illegal_return": -10
         # }
 
-
-
         # agent definition
         self.possible_agents = ([f"uav_{i}_{j}" for j in range(self.uav_num) for i in range(self.group_num)]
                                 + [f"truck_{i}_{j}" for j in range(self.truck_num) for i in range(self.group_num)])
@@ -165,17 +164,21 @@ class DeliveryEnv(ParallelEnv):
         self.delivery_per_trip = None  # count number of nodes delivered by uav in one trip to encourage multi-visit.
 
         self.reward_dict = {
-            "every_time_step": -0.1,
-            "uav_charging": lambda power: 0 if power < self.low_power_threshold * self.uav_power else 0,
+            "every_time_step": -1.5,
+            "travel_neg_reward": lambda a, b: 0.7 * max(min(self.space_width, self.space_height) - math.sqrt((b[0] - a[0])**2 + (b[1] - a[1])**2), 0),
+            "uav_multi_visit": lambda uav_name: self.delivery_per_trip[uav_name] * 2,
+            "mission_completed": 10 * (lambda: max(self.max_step * 0.85 - self.time_step, 0))(),
+            "uav_not_greedy": -5,
+
+            # unused
             "uav_deliver_node": 0,
-            "mission_completed": (lambda: max(self.max_step - self.time_step, 0))(),
-            "uav_trip_delivery_bonus": lambda uav_name: 5 * (self.delivery_per_trip[uav_name] - 1),
+            "uav_charging": lambda power: 0 if power < self.low_power_threshold * self.uav_power else 0,
             "uav_round_trip": lambda distance, load: 0,
-            "uav_out_of_power": -10,
-            "uav_out_of_capacity": -10,
-            "uav_out_of_cluster": -10,
-            "uav_out_of_power_return": -10,
-            "uav_closed_nodes": -5,
+            "uav_out_of_power": 0,
+            "uav_out_of_capacity": 0,
+            "uav_out_of_cluster": 0,
+            "uav_out_of_power_return": 0,
+            "uav_closed_nodes": 0,
             "uav_current_target": 0,
             "truck_current_target": 0,
             "truck_serve_customer": 0,
@@ -246,9 +249,14 @@ class DeliveryEnv(ParallelEnv):
         # reset the variables
         self.agents = copy(self.possible_agents)
         self.time_step = 0
-        self.infos = {"cur_time_step": self.time_step, "max_step": self.max_step, "num_customer": self.num_customer}
+        self.infos = {
+            "cur_time_step": self.time_step,
+            "max_step": self.max_step,
+            "num_customer": self.num_customer,
+            "r": {agent: 0 for agent in self.possible_agents}
+        }
 
-        if self.nodes_location is None or options.get("redistribute", True):
+        if self.nodes_location is None or options is not None and options.get("redistribute", True):
             while True:
                 self.kmeans = None
                 self.nodes_location = self._generate_nodes()
@@ -340,6 +348,8 @@ class DeliveryEnv(ParallelEnv):
                     group_num, _ = self._get_agent_group(agent)
                     self.truck_loaded_uav[f"truck_{group_num}_0"].discard(agent)  # unregister uav
                     self.agent_status[agent] = UAVState.DELIVERING.value
+                    rewards[agent] += self.reward_dict["travel_neg_reward"](self.agent_coordinates[agent], self.nodes_location[act])
+                    rewards[agent] += self.reward_dict["uav_multi_visit"](agent)
                 else:
                     self.node_mask[act] = PackageState.ASSIGNED.value
                     self.agent_target[agent] = act
@@ -359,6 +369,8 @@ class DeliveryEnv(ParallelEnv):
                                   self.agent_coordinates[f"truck_{group_num}_0"]):
                     rewards[agent] += self.reward_dict["truck_current_target"]
                     continue
+                if any(x == UAVActionRet.FEASIBLE.value for x in observations[agent]["choice_mask"]):
+                    rewards[agent] += self.reward_dict["uav_not_greedy"]
                 self.agent_status[agent] = UAVState.RETURNING.value
                 self.agent_target[agent] = f"truck_{group_num}_{act - self.num_customer}"
             else:
@@ -419,7 +431,6 @@ class DeliveryEnv(ParallelEnv):
                         rewards[agent] += self.reward_dict["uav_round_trip"](self.cur_uav_travel_distance[agent],
                                                                              self.cur_uav_capacity[agent])
                         rewards[agent] += self.reward_dict["uav_charging"](self.cur_uav_power[agent])
-                        rewards[agent] += self.reward_dict["uav_trip_delivery_bonus"](agent)
                         self.delivery_per_trip[agent] = 0
                         self.cur_uav_travel_distance[agent] = 0
                         self.cur_uav_power[agent] = self.uav_power
@@ -524,24 +535,27 @@ class DeliveryEnv(ParallelEnv):
                         x == PackageState.DELIVERED.value for x in self.node_mask):
                     self.terminations[agent] = True
                 elif agent.startswith("uav") and self.group_assigned[group_num] is None:
-                    self.terminations[agent] = False
+                    self.terminations[agent] = True # TODO: check
                 elif agent.startswith("uav"):
                     # self.terminations[agent] = self._is_cluster_delivered(
                     #     self.group_assigned[group_num]) and self._get_action_mask(agent)
                     self.terminations[agent] = self._is_cluster_delivered(
                         self.group_assigned[group_num]) and self.agent_status[agent] == UAVState.IDLE.value
                 else:  # truck
-                    self.terminations[agent] = (self._get_action_mask(agent)
-                                                and np.array_equal(np.array(self.agent_coordinates[agent]),
+                    self.terminations[agent] = (np.array_equal(np.array(self.agent_coordinates[agent]),
                                                                    np.array(self.warehouse))
                                                 and all(
                                 self._is_cluster_delivered(cluster) for cluster in range(self.cluster_number)))
 
-            observations = self._get_observations()
             if not training or all(self.terminations[agent] for agent in self.possible_agents):
                 break
             else:
                 self.render()
+        observations = self._get_observations()
+        for agent in self.possible_agents:
+            self.infos['r'][agent] += rewards[agent]
+        if all(self.terminations.values()):
+            self.infos['end'] = True
         return observations, rewards, self.terminations, self.truncation, self.infos
 
     def render(self):
@@ -669,21 +683,23 @@ class DeliveryEnv(ParallelEnv):
 
         if agent.startswith("truck"):
             if self.group_assigned[group_num] is None:
-                return status == TruckState.LANDING.value and all(
+                return (status == TruckState.LANDING.value and all(
                     self.agent_status[f"uav_{group_num}_{i}"] in (UAVState.IDLE.value, UAVState.INIT.value) for i in
                     range(self.uav_num))
+                        and (not np.array_equal(np.array(self.agent_coordinates[agent]), np.array(self.warehouse)) or self.time_step == 0))
             else:
                 return (status == TruckState.LANDING.value and all(
                     self.agent_status[f"uav_{group_num}_{i}"] in (UAVState.IDLE.value, UAVState.INIT.value) for i in
                     range(self.uav_num))
-                        and self._is_cluster_delivered(self.group_assigned[group_num]))
+                        and self._is_cluster_delivered(self.group_assigned[group_num]) and (not np.array_equal(np.array(self.agent_coordinates[agent]), np.array(self.warehouse)) or self.time_step == 0))
         else:
             # TODO: a uav cannot move when the cluster is delivered
             # return (status == UAVState.IDLE.value or status == UAVState.LANDING.value) and all(
             #     self.agent_status[f"truck_{group_num}_{i}"] == TruckState.LANDING.value for i in range(self.truck_num))
             return (status == UAVState.LANDING.value or status == UAVState.IDLE.value and all(
                 self.agent_status[f"truck_{group_num}_{i}"] == TruckState.LANDING.value for i in range(self.truck_num))
-                    and not self._is_cluster_delivered(self.group_assigned[group_num]))
+                    and not self._is_cluster_delivered(self.group_assigned[group_num])
+                    and not np.array_equal(np.array(self.agent_coordinates[agent]), np.array(self.warehouse)))
 
     def _generate_nodes(self, distribution="uniform"):
         """generate the nodes in the space

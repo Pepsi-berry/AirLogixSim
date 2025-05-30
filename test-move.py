@@ -2,26 +2,26 @@ import pygame
 import time
 from env.MultiAgentEnv import DeliveryEnv, PackageState, UAVActionRet
 
-frame_rate = 1
+frame_rate = 24
 # env = DeliveryEnv({"uav_num": 1, "uav_velocity": 5/frame_rate, "truck_velocity": 2/frame_rate, "uav_power": 20, "power_coefficient": 0.2})
 env = DeliveryEnv({
-        "uav_num": 1,
-        "uav_velocity": 5,
-        "truck_velocity": 3,
+        "uav_num": 2,
+        "uav_velocity": 5/frame_rate,
+        "truck_velocity": 3/frame_rate,
         "uav_power": 40,
         "power_coefficient": 0.3,
-        "num_customer": 40,
+        "num_customer": 30,
         "space_width": 10,
         "space_height": 10,
         "cluster_number": 4,
-        "max_step": 10_000,
+        "max_step": 200000,
         "render_mode": "human",
     })
 observation, info = env.reset()
 env.render()
 
 # print(env.kmeans.labels_)
-# print(observation)
+print(observation)
 # print("==" * 20)
 # print(info)
 # exit(0)
@@ -32,7 +32,6 @@ running = True
 index = 1
 cluster = 0
 while running:
-    # input()
     action = {}
     print(info['cur_time_step'])
     # print(observation)
@@ -61,7 +60,7 @@ while running:
                     break
             # print(observation[f"uav_0_{x}"]['choice_mask'])
             # action[f'uav_0_{x}'] = 0
-    observation, reward, termination, truncation, info = env.step(action, training=True)
+    observation, reward, termination, truncation, info = env.step(action, training=False)
 
     running = not truncation and any([not t for t in termination.values()])
 
@@ -74,13 +73,14 @@ while running:
     print("==" * 20)
 
     env.render()
-    # time.sleep(1/frame_rate)
+    time.sleep(1/frame_rate)
     # for event in pygame.event.get():
     #     if event.type == pygame.QUIT:
     #         running = False
 print("==" * 20)
 print(observation)
 print("==" * 20)
+print(info)
 input()
 
 env.close()
