@@ -1,0 +1,50 @@
+simulation:
+  max_simulation_time: 10000
+  simulation_interval: 0.5 # in seconds, for transmission, computation, task generation and assignment, etc.
+  traffic_interval: 0.5 # in seconds, for traffic simulation. Remember to set the same value in the SUMO configuration file; otherwise, the simulation will not work properly
+
+sumo:
+  sumo_config: "./sumo/simple/simple.sumocfg"
+  sumo_osm: "./sumo/wujiaochang/osm_bbox.osm.xml" # this path is only used in tkinter_layout.py, that is to say that the file is loaded for visualization
+  sumo_net: "./sumo/simple/simple.net.xml"
+  sumo_port: 8813
+  export_tripinfo: False # 如果True，则导出tripinfo.xml文件（很大）
+  tripinfo_output: ""
+
+state_attribute:
+  log_state: False # Whether to log the state attributes
+  time_window: 3 # The time window for state attributes statistics
+  vehicle_state_attributes: ['position_x', 'position_y', 'position_z', 'speed']
+  UAV_state_attributes: ['position_x', 'position_y', 'position_z', 'speed']
+  package_state_attributes: ['package_id', 'package_weight', 'package_deadline', 'package_arrival_time', 'package_destination']
+
+task:
+  num_tasks: 20  # 增加任务数量以适应多组协同
+  "x_range": [0, 1000]
+  "y_range": [0, 1000]
+  "min_package_weight": 2.5  # kg
+  "max_package_weight": 5.0  # kg
+  "min_delivery_time": 300 # seconds
+  "max_delivery_time": 1800  # seconds
+
+traffic:
+  traffic_mode: "SUMO" # "real" or "SUMO"
+  tripinfo: "./sumo_wujiaochang/tripinfo.csv" # The path to the SUMO tripinfo file
+  traffic_interval: 0.5 # in seconds, for traffic simulation. Remember to set the same value in the SUMO configuration file; otherwise, the simulation will not work properly
+  warehouse_position: [0, 0, 0] # The position of the warehouse
+  UAV_z_range: [1, 2] # The range of z coordinates for UAVs
+  UAV_speed_range: [15,20] # The speed of UAV (distance unit per timeslot)
+  UAV_traffic_file: "path/to/UAV_traffic_file.csv" # UAV traffic file
+  vehicle_count: 1 # Number of vehicles per group - 每组2辆车
+  UAV_count: 1 # Number of UAVs per group - 每组3架无人机
+  UAV_weight: 1 # The weight of UAV
+  UAV_capacity: 10 # The capacity of package that UAV can carry
+  UAV_battery_capacity: 100 # The battery capacity of UAV
+  UAV_energy_consumption_rate: 0.01 # The energy consumption rate of UAV
+  low_power_threshold: 0.5 # The threshold of power to check if the UAV is low power
+  group_num: 1 # Number of groups to simulate - 3组协同工作
+  distance_threshold: 0.5 # The distance threshold to check if the node is reach target position
+  nonfly_zone_coordinates: [[[1000, 1200], [1200, 1200], [1200, 1000], [1000, 1000]],[[1500, 1700], [1700, 1700], [1700, 1500], [1500, 1500]]] # The non-fly zones in the simulation area, each zone is represented by a list of x1, y1, x2, y2, x3, y3 coordinates
+clustering:
+  cluster_number: 5
+

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<routes>
+    <vType id="truck" accel="2.6" decel="4.5" sigma="0.5" length="7.5" minGap="2.5" maxSpeed="25" guiShape="truck"/>
+    
+    <route id="route_0" edges="e1 e2 e3 e4"/>
+    <route id="route_1" edges="e1 e5 e6 e7"/>
+    <route id="route_2" edges="e4 e1 e5 e6"/>
+    <route id="route_3" edges="e7 e4 e1 e2"/>
+</routes> 

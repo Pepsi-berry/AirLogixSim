@@ -1,0 +1,36 @@
+simulation:
+  max_simulation_time: 1000  # Maximum simulation time in seconds
+  simulation_interval: 0.1   # Simulation step interval in seconds
+  traffic_interval: 1.0      # Traffic update interval in seconds
+
+sumo:
+  sumo_config: ""
+  sumo_net: ""
+  sumo_port: 8813
+  export_tripinfo: false
+  tripinfo_output: "tripinfo.xml"
+
+traffic:
+  traffic_mode: "FILE"  # Use FILE mode instead of SUMO
+  vehicle_count: 10     # Number of vehicles to simulate
+  UAV_count: 5          # Number of UAVs to simulate
+  x_range: [0, 1000]    # X range for simulation area
+  y_range: [0, 1000]    # Y range for simulation area
+  UAV_z_range: [50, 150]  # Altitude range for UAVs in meters
+  UAV_speed_range: [15, 30]  # Speed range for UAVs in m/s
+  UAV_docking_z_offset: 2.0  # Height offset for docked UAVs
+  distance_threshold: 5.0  # Distance threshold for UAV to consider reaching destination
+  nonfly_zone_coordinates: []  # Coordinates of no-fly zones
+  # Path to prerecorded vehicle traces for FILE mode
+  tripinfo: "sample_vehicle_data.csv"  # You'll need to create this file with sample vehicle data
+
+# Task-related configuration for future expansion
+task:
+  package_generation:
+    enabled: false
+    rate: 0.1  # Packages per second
+
+# State attributes for logging
+state_attribute:
+  log_state: false
+  save_path: "logs/" 
